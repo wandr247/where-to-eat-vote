@@ -1,5 +1,6 @@
 // Where should we eat? — shared rooms (zero dependencies)
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
+const { roomImage } = require('./ogimage');
 
 const PORT = +process.env.PORT || 3000;
 // All persistent storage lives under DATA_DIR (default: the app folder). On Railway mount a volume at /data and set DATA_DIR=/data.
@@ -162,10 +163,63 @@ const page = name => { // read on each request in dev would be nicer; cache is f
   if (!pages[name]) pages[name] = fs.readFileSync(path.join(__dirname, name));
   return pages[name];
 };
-const sendHtml = (res, name, status = 200) => {
+const sendHtml = (res, name, status = 200, transform) => {
+  let body = page(name);
+  if (transform) body = Buffer.from(transform(body.toString('utf8')), 'utf8');
   res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'same-origin' });
-  res.end(page(name));
+  res.end(body);
 };
+
+// ---------- link previews (Open Graph / Twitter cards) ----------
+const APP_NAME = 'Spin and Eat';
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+// absolute origin for the request: honours the proxy's x-forwarded-* headers; https unless running on localhost
+function baseUrl(req) {
+  const first = v => (v || '').toString().split(',')[0].trim();
+  let host = first(req.headers['x-forwarded-host']) || first(req.headers.host);
+  if (!/^[A-Za-z0-9.-]+(:\d{1,5})?$/.test(host)) host = 'localhost';
+  const local = /^(localhost|127\.0\.0\.1|\[::1\]|::1)(:|$)/.test(host);
+  let proto = first(req.headers['x-forwarded-proto']).toLowerCase();
+  if (proto !== 'http' && proto !== 'https') proto = local ? 'http' : 'https';
+  return proto + '://' + host;
+}
+function ogTags({ title, desc, image, url, alt }) {
+  return [
+    ['property', 'og:site_name', APP_NAME], ['property', 'og:type', 'website'], ['property', 'og:title', title], ['property', 'og:description', desc],
+    ['property', 'og:url', url], ['property', 'og:image', image], ['property', 'og:image:type', 'image/png'], ['property', 'og:image:width', '1200'], ['property', 'og:image:height', '630'], ['property', 'og:image:alt', alt],
+    ['name', 'twitter:card', 'summary_large_image'], ['name', 'twitter:title', title], ['name', 'twitter:description', desc], ['name', 'twitter:image', image], ['name', 'twitter:image:alt', alt],
+    ['name', 'description', desc]
+  ].map(([k, n, v]) => `<meta ${k}="${n}" content="${esc(v)}">`).join('\n') + '\n';
+}
+const injectHead = (html, title, tags) =>
+  html.replace(/<title>[\s\S]*?<\/title>/i, () => `<title>${esc(title)}</title>\n${tags}`);
+const DEFAULT_ALT = "Spin and Eat: a colorful spinning wheel and a plate with fork and knife. Can't decide where to eat? Vote or spin.";
+function sendLanding(req, res) {
+  const base = baseUrl(req);
+  const title = APP_NAME + ' – decide where to eat together';
+  const tags = ogTags({ title, desc: "Can't decide where to eat? Vote or spin.", image: base + '/og-default.png', url: base + '/', alt: DEFAULT_ALT });
+  sendHtml(res, 'index.html', 200, h => injectHead(h, title, tags));
+}
+function sendRoomPage(req, res, url) {
+  const base = baseUrl(req), m = url.match(/^\/r\/(\d{4})(\/wheel)?\/?$/), code = m[1], room = getRoom(code);
+  const pageUrl = base + '/r/' + code + (m[2] ? '/wheel' : '');
+  let title, desc, image, alt;
+  if (room) {
+    title = `Join room ${code} on ${APP_NAME}`; desc = 'Vote on where to eat or spin the wheel together.';
+    image = `${base}/og/${code}.png`; alt = `Join room ${code} on Spin and Eat`;
+  } else {
+    title = APP_NAME + ' – decide where to eat together'; desc = "Can't decide where to eat? Vote or spin.";
+    image = base + '/og-default.png'; alt = DEFAULT_ALT;
+  }
+  const tags = ogTags({ title, desc, image, url: pageUrl, alt });
+  sendHtml(res, 'room.html', 200, h => injectHead(h, room ? `Room ${code} – ${APP_NAME}` : title, tags));
+}
+const staticFiles = {};
+function sendPng(res, buf, maxAge) {
+  res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': buf.length, 'Cache-Control': 'public, max-age=' + maxAge, 'X-Content-Type-Options': 'nosniff' });
+  res.end(buf);
+}
+const defaultImage = () => staticFiles.def || (staticFiles.def = fs.readFileSync(path.join(__dirname, 'static', 'og-default.png')));
 
 const hits = new Map(); // 'kind:ip' -> [timestamps]
 function allowed(kind, ip, limit, windowMs) {
@@ -204,8 +258,16 @@ http.createServer(async (req, res) => {
 
   // pages
   if (req.method === 'GET') {
-    if (url === '/' || url === '/index.html') return sendHtml(res, 'index.html');
-    if (/^\/r\/\d{4}(\/wheel)?\/?$/.test(url)) return sendHtml(res, 'room.html');
+    if (url === '/' || url === '/index.html') return sendLanding(req, res);
+    if (/^\/r\/\d{4}(\/wheel)?\/?$/.test(url)) return sendRoomPage(req, res, url);
+    if (url === '/og-default.png') { try { return sendPng(res, defaultImage(), 86400); } catch (e) { res.writeHead(404); return res.end('Not found'); } }
+    const om = url.match(/^\/og\/(\d{4})\.png$/);
+    if (om) {
+      try {
+        // unknown / expired rooms get the default card
+        return sendPng(res, getRoom(om[1]) ? roomImage(path.join(__dirname, 'static'), om[1]) : defaultImage(), 3600);
+      } catch (e) { console.error('og image failed', e.message); res.writeHead(500, { 'Content-Type': 'text/plain' }); return res.end('Image unavailable'); }
+    }
     if (url === '/wheel') { res.writeHead(302, { Location: '/' }); return res.end(); }
     if (url === '/healthz') return json(res, { ok: true, rooms: Object.keys(rooms).length, saved: Object.keys(saved).length });
     if (url === '/api/time') return json(res, { now: Date.now() });
@@ -230,11 +292,8 @@ http.createServer(async (req, res) => {
     const now = Date.now();
     rooms[code] = {
       code, created: now, expires: now + TTL_MS,
-      restaurants: fromSaved ? freshRestaurants(fromSaved) : [
-        { id: 1, name: 'Pizza Place', note: 'Wood-fired pizza', votes: 0 },
-        { id: 2, name: 'Sushi Spot', note: 'Rolls and sashimi', votes: 0 },
-        { id: 3, name: 'Taco Corner', note: 'Casual tacos', votes: 0 }],
-      nextId: fromSaved ? MAX_SAVED_ITEMS + 1 : 4, voters: {},
+      restaurants: fromSaved ? freshRestaurants(fromSaved) : [],
+      nextId: fromSaved ? MAX_SAVED_ITEMS + 1 : 1, voters: {},
       wheel: { angle: 0, spin: null, spinSeq: 0 }
     };
     save();
