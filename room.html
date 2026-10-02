@@ -23,6 +23,12 @@ button:disabled{opacity:.5;cursor:default}
 .small{font-size:.8em;padding:4px 8px}
 form{display:flex;gap:8px;flex-wrap:wrap;margin-top:20px}input{padding:8px;border:1px solid #ccc;border-radius:8px;font-size:1em}
 .lead{background:#fff3bf;padding:8px 12px;border-radius:8px;margin:10px 0}
+.saveBox{margin-top:18px;border-top:1px solid #0001;padding-top:14px}
+.saveBox .row2{display:flex;gap:8px;flex-wrap:wrap}
+.scodeBig{font-size:2.6em;font-weight:800;letter-spacing:.18em;color:#e8590c;margin:6px 0;font-family:ui-monospace,monospace}
+input.scode{text-transform:uppercase;letter-spacing:.15em;width:9ch}
+#savedPanel,#loadForm{display:none}
+#savedPanel{background:#fff;border-radius:12px;padding:14px;margin:10px 0;box-shadow:0 1px 4px #0001;text-align:center}
 #wheelView{text-align:center}
 #wheelView form{justify-content:center;margin:16px 0}#wheelView form input{flex:1;max-width:260px;padding:10px}
 .wrap{position:relative;width:min(88vw,420px);margin:20px auto}
@@ -49,6 +55,16 @@ canvas{width:100%;height:auto;display:block}
   <div id="lead"></div><div id="list"></div>
   <form id="add"><input id="n" placeholder="Restaurant name" maxlength="80" required><input id="d" placeholder="Note (optional)" maxlength="160"><button class="vote">Add restaurant</button></form>
   <p><button class="small" id="reset">Reset all votes</button></p>
+  <div class="saveBox">
+    <div class="row2"><button class="vote" id="saveBtn">💾 Save this list</button><button id="loadBtn">📂 Load saved list</button></div>
+    <div id="savedPanel">
+      <div id="savedMsg"></div>
+      <div class="scodeBig" id="savedCode"></div>
+      <button id="savedCopy">📋 Copy code</button>
+      <div class="sub" style="margin:8px 0 0;font-size:.85em">Keep this code. Enter it on the home page (or "Load saved list") any time to bring this list back. Votes aren't saved.</div>
+    </div>
+    <form id="loadForm" style="margin-top:10px"><input class="scode" id="lcode" maxlength="7" placeholder="ABC234" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Saved list code"><button class="vote">Load</button></form>
+  </div>
 </section>
 
 <section id="wheelView" style="display:none">
@@ -149,6 +165,35 @@ function edit(id){const r=S.restaurants.find(x=>x.id===id);if(!r)return;const n=
 function del(id){if(confirm('Delete this restaurant?'))api('DELETE','/restaurants/'+id)}
 $('add').onsubmit=async e=>{e.preventDefault();const r=await api('POST','/restaurants',{name:$('n').value,note:$('d').value});if(r){$('n').value=$('d').value=''}};
 $('reset').onclick=()=>{if(confirm('Reset all votes for everyone in this room?'))api('POST','/reset')};
+
+// ----- saved lists -----
+const lsGet=(k)=>{try{return JSON.parse(localStorage[k]||'{}')||{}}catch{return {}}};
+const lsSet=(k,o)=>{try{localStorage[k]=JSON.stringify(o)}catch{}};
+$('saveBtn').onclick=async()=>{
+  const prev=lsGet('savedFor')[code],tokens=lsGet('savedTokens');
+  $('saveBtn').disabled=true;
+  try{
+    const r=await fetch(base+'/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({voter,savedCode:prev&&tokens[prev]?prev:undefined,token:prev?tokens[prev]:undefined})});
+    const d=await r.json().catch(()=>({}));
+    if(r.status===404&&/Room/.test(d.error||''))return showGone();
+    if(!r.ok){toast(d.error||'Could not save');return}
+    if(d.token){tokens[d.code]=d.token;lsSet('savedTokens',tokens)}
+    const f=lsGet('savedFor');f[code]=d.code;lsSet('savedFor',f);
+    $('savedMsg').textContent=d.updated?'✅ Saved list updated ('+d.count+' restaurants). Same code as before:':'✅ List saved ('+d.count+' restaurants). Your code:';
+    $('savedCode').textContent=d.code;$('savedPanel').style.display='block';$('loadForm').style.display='none';
+  }catch{toast('Network error')}
+  finally{$('saveBtn').disabled=false}
+};
+$('savedCopy').onclick=async()=>{await copy($('savedCode').textContent);toast('Code copied')};
+$('loadBtn').onclick=()=>{const f=$('loadForm');const show=f.style.display!=='flex';f.style.display=show?'flex':'none';$('savedPanel').style.display='none';if(show)$('lcode').focus()};
+$('lcode').oninput=e=>{e.target.value=e.target.value.toUpperCase().replace(/[^A-Z0-9-]/g,'').slice(0,7)};
+$('loadForm').onsubmit=async e=>{
+  e.preventDefault();const c=$('lcode').value.replace(/-/g,'');
+  if(!/^[A-Z0-9]{6}$/.test(c)){toast('Enter the 6-character saved list code');return}
+  if(S&&S.restaurants.length&&!confirm('Replace this room\'s list with the saved list? Current votes will be cleared for everyone.'))return;
+  const d=await api('POST','/load-saved',{code:c});
+  if(d){const f=lsGet('savedFor');f[code]=d.loadedCode;lsSet('savedFor',f);$('lcode').value='';$('loadForm').style.display='none';toast('Loaded saved list '+d.loadedCode)}
+};
 
 // ----- wheel -----
 const COLORS=['#ff6b6b','#ffa94d','#ffd43b','#69db7c','#4dabf7','#9775fa','#f783ac','#38d9a9'];

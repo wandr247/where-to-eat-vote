@@ -2,12 +2,32 @@
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 
 const PORT = +process.env.PORT || 3000;
-const DB = process.env.DATA_FILE || path.join(__dirname, 'data.json');
+// All persistent storage lives under DATA_DIR (default: the app folder). On Railway mount a volume at /data and set DATA_DIR=/data.
+function resolveDataDir() {
+  const want = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : __dirname;
+  for (const dir of [want, __dirname]) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const probe = path.join(dir, '.write-test-' + process.pid);
+      fs.writeFileSync(probe, 'ok'); fs.unlinkSync(probe);
+      if (dir !== want) console.error(`DATA_DIR ${want} is not usable; falling back to ${dir} (data will NOT persist across redeploys)`);
+      return dir;
+    } catch (e) { console.error('data dir not usable:', dir, e.message); }
+  }
+  return want;
+}
+const DATA_DIR = resolveDataDir();
+const DB = process.env.DATA_FILE || path.join(DATA_DIR, 'data.json');
+const SAVED_DB = path.join(DATA_DIR, 'saved-lists.json');
 const TTL_MS = +process.env.ROOM_TTL_MS || 24 * 60 * 60 * 1000;   // room lifetime (24h)
 const MAX_ROOMS = +process.env.MAX_ROOMS || 500;
-const MAX_RESTAURANTS = 30, MAX_WHEEL = 30, MAX_VOTERS = 1000, MAX_CLIENTS_PER_ROOM = 200;
+const MAX_RESTAURANTS = 50, MAX_WHEEL = 30, MAX_VOTERS = 1000, MAX_CLIENTS_PER_ROOM = 200;
 const SPIN_LEAD_MS = 600, SPIN_DURATION_MS = 5000;
 const CREATE_LIMIT = +process.env.CREATE_LIMIT || 60;              // rooms per IP per hour
+const MAX_SAVED = +process.env.MAX_SAVED || 5000, MAX_SAVED_ITEMS = 50;
+const SAVE_LIMIT = +process.env.SAVE_LIMIT || 30;                  // new saved lists / updates per IP per hour
+const LOOKUP_LIMIT = +process.env.LOOKUP_LIMIT || 120;             // saved-code lookups per IP per 10 minutes
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';           // no 0 O 1 I L
 
 // ---------- state ----------
 let rooms = {};   // code -> room (persisted)
@@ -22,10 +42,37 @@ function save() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => { saveTimer = null; saveNow(); }, 250);
 }
+// atomic + durable write: temp file, fsync, rename
+function writeAtomic(file, text) {
+  const tmp = file + '.' + process.pid + '.tmp';
+  const fd = fs.openSync(tmp, 'w');
+  try { fs.writeSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  fs.renameSync(tmp, file);
+}
 function saveNow() {
-  try { fs.writeFileSync(DB + '.tmp', JSON.stringify({ rooms })); fs.renameSync(DB + '.tmp', DB); }
+  try { writeAtomic(DB, JSON.stringify({ rooms })); }
   catch (e) { console.error('save failed', e.message); }
 }
+
+// ---------- saved lists (permanent) ----------
+let saved = {};   // CODE -> { code, created, updated, tokenHash, items:[{name,note}] }
+try {
+  const d = JSON.parse(fs.readFileSync(SAVED_DB, 'utf8'));
+  if (d && d.lists && typeof d.lists === 'object') saved = d.lists;
+} catch (e) { if (e.code !== 'ENOENT') console.error('could not read saved lists:', e.message); }
+function persistSaved() { writeAtomic(SAVED_DB, JSON.stringify({ lists: saved })); }   // throws on failure
+const SAVED_CODE_RE = /^[A-Z2-9]{6}$/;
+const normSavedCode = s => typeof s === 'string' ? s.toUpperCase().replace(/[\s-]/g, '') : '';
+const hashToken = t => crypto.createHash('sha256').update(String(t)).digest('hex');
+function newSavedCode() {
+  for (let i = 0; i < 1000; i++) {
+    let c = '';
+    for (let k = 0; k < 6; k++) c += CODE_ALPHABET[crypto.randomInt(0, CODE_ALPHABET.length)];
+    if (!saved[c]) return c;
+  }
+  return null;
+}
+const sameHash = (a, b) => typeof a === 'string' && typeof b === 'string' && a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 
 function purge() {
   const now = Date.now();
@@ -92,13 +139,25 @@ const sendHtml = (res, name, status = 200) => {
   res.end(page(name));
 };
 
-const createHits = new Map(); // ip -> [timestamps]
-function createAllowed(ip) {
-  const now = Date.now(), arr = (createHits.get(ip) || []).filter(t => now - t < 3600000);
-  if (arr.length >= CREATE_LIMIT) { createHits.set(ip, arr); return false; }
-  arr.push(now); createHits.set(ip, arr); return true;
+const hits = new Map(); // 'kind:ip' -> [timestamps]
+function allowed(kind, ip, limit, windowMs) {
+  const key = kind + ':' + ip, now = Date.now(), arr = (hits.get(key) || []).filter(t => now - t < windowMs);
+  if (arr.length >= limit) { hits.set(key, arr); return false; }
+  arr.push(now); hits.set(key, arr); return true;
 }
-setInterval(() => { const now = Date.now(); for (const [ip, a] of createHits) if (!a.some(t => now - t < 3600000)) createHits.delete(ip); }, 600000).unref();
+const createAllowed = ip => allowed('create', ip, CREATE_LIMIT, 3600000);
+setInterval(() => { const now = Date.now(); for (const [k, a] of hits) if (!a.some(t => now - t < 3600000)) hits.delete(k); }, 600000).unref();
+
+// look up a saved list by user-typed code; returns { list } or { status, msg }
+function lookupSaved(ip, raw) {
+  if (!allowed('lookup', ip, LOOKUP_LIMIT, 600000)) return { status: 429, msg: 'Too many attempts. Please wait a few minutes and try again.' };
+  const c = normSavedCode(raw);
+  if (!SAVED_CODE_RE.test(c)) return { status: 400, msg: 'Saved list codes are 6 characters (letters and numbers).' };
+  const list = Object.prototype.hasOwnProperty.call(saved, c) ? saved[c] : null;
+  if (!list) return { status: 404, msg: `No saved list with code ${c}. Check the code and try again.` };
+  return { list };
+}
+const freshRestaurants = list => list.items.slice(0, MAX_SAVED_ITEMS).map((it, i) => ({ id: i + 1, name: clean(it.name, 80), note: clean(it.note, 160), votes: 0 })).filter(r => r.name);
 
 function newCode() {
   for (let i = 0; i < 1000; i++) {
@@ -120,13 +179,22 @@ http.createServer(async (req, res) => {
     if (url === '/' || url === '/index.html') return sendHtml(res, 'index.html');
     if (/^\/r\/\d{4}(\/wheel)?\/?$/.test(url)) return sendHtml(res, 'room.html');
     if (url === '/wheel') { res.writeHead(302, { Location: '/' }); return res.end(); }
-    if (url === '/healthz') return json(res, { ok: true, rooms: Object.keys(rooms).length });
+    if (url === '/healthz') return json(res, { ok: true, rooms: Object.keys(rooms).length, saved: Object.keys(saved).length });
     if (url === '/api/time') return json(res, { now: Date.now() });
   }
 
   // create room
   if (url === '/api/rooms' && req.method === 'POST') {
     purge();
+    const b0 = await readBody(req);
+    if (b0 === 'TOO_BIG') { res.setHeader('Connection', 'close'); return err(res, 413, 'Request too large'); }
+    if (b0 === null) return err(res, 400, 'Invalid request body');
+    let fromSaved = null;
+    if (b0.saved !== undefined && b0.saved !== '') {
+      const f = lookupSaved(ip, b0.saved);
+      if (!f.list) return err(res, f.status, f.msg);
+      fromSaved = f.list;
+    }
     if (!createAllowed(ip)) return err(res, 429, 'Too many rooms created from your network. Try again later.');
     if (Object.keys(rooms).length >= MAX_ROOMS) return err(res, 503, 'The server is full of active rooms right now. Please try again later.');
     const code = newCode();
@@ -134,16 +202,25 @@ http.createServer(async (req, res) => {
     const now = Date.now();
     rooms[code] = {
       code, created: now, expires: now + TTL_MS,
-      restaurants: [
+      restaurants: fromSaved ? freshRestaurants(fromSaved) : [
         { id: 1, name: 'Pizza Place', note: 'Wood-fired pizza', votes: 0 },
         { id: 2, name: 'Sushi Spot', note: 'Rolls and sashimi', votes: 0 },
         { id: 3, name: 'Taco Corner', note: 'Casual tacos', votes: 0 }],
-      nextId: 4, voters: {},
+      nextId: fromSaved ? MAX_SAVED_ITEMS + 1 : 4, voters: {},
       wheel: { items: [], nextId: 1, angle: 0, spin: null, spinSeq: 0 }
     };
-    for (const n of ['Pizza', 'Sushi', 'Tacos']) rooms[code].wheel.items.push({ id: rooms[code].wheel.nextId++, name: n });
+    const wnames = fromSaved ? rooms[code].restaurants.slice(0, MAX_WHEEL).map(r => clean(r.name, 40)) : ['Pizza', 'Sushi', 'Tacos'];
+    for (const n of wnames) rooms[code].wheel.items.push({ id: rooms[code].wheel.nextId++, name: n });
     save();
-    return json(res, { code, expires: rooms[code].expires, now }, 201);
+    return json(res, { code, expires: rooms[code].expires, now, savedCode: fromSaved ? fromSaved.code : undefined }, 201);
+  }
+
+  // saved list preview (name + item count only for existence checks)
+  const sm = url.match(/^\/api\/saved\/([^/]+)$/);
+  if (sm && req.method === 'GET') {
+    const f = lookupSaved(ip, decodeURIComponent(sm[1]).slice(0, 20));
+    if (!f.list) return err(res, f.status, f.msg);
+    return json(res, { code: f.list.code, count: f.list.items.length, updated: f.list.updated });
   }
 
   const m = url.match(/^\/api\/rooms\/(\d{4})(\/.*)?$/);
@@ -180,6 +257,42 @@ http.createServer(async (req, res) => {
   // once a finished spin exists, editing the wheel clears it (keeps the resting angle)
   const settleSpin = () => { if (room.wheel.spin) { room.wheel.angle = room.wheel.spin.to; room.wheel.spin = null; } };
   let mm;
+
+  // --- saved lists ---
+  if (sub === '/save' && req.method === 'POST') {
+    const items = room.restaurants.slice(0, MAX_SAVED_ITEMS).map(r => ({ name: clean(r.name, 80), note: clean(r.note, 160) })).filter(r => r.name);
+    if (!items.length) return err(res, 400, 'Add at least one restaurant before saving');
+    if (!allowed('save', ip, SAVE_LIMIT, 3600000)) return err(res, 429, 'Too many saves from your network. Try again later.');
+    const now = Date.now();
+    const prevCode = normSavedCode(b.savedCode), prev = SAVED_CODE_RE.test(prevCode) && Object.prototype.hasOwnProperty.call(saved, prevCode) ? saved[prevCode] : null;
+    let list, updated = false, token = null, before = null;
+    if (prev && typeof b.token === 'string' && b.token.length >= 16 && b.token.length <= 128 && sameHash(prev.tokenHash, hashToken(b.token))) {
+      list = prev; updated = true; before = { items: prev.items, updated: prev.updated };
+      list.items = items; list.updated = now;
+    } else {
+      if (Object.keys(saved).length >= MAX_SAVED) return err(res, 503, 'Saved lists are full right now. Please try again later.');
+      const c = newSavedCode();
+      if (!c) return err(res, 503, 'Could not create a code right now. Please try again.');
+      token = crypto.randomBytes(24).toString('base64url');
+      list = saved[c] = { code: c, created: now, updated: now, tokenHash: hashToken(token), items };
+    }
+    try { persistSaved(); }
+    catch (e) {
+      console.error('saved-lists write failed', e.message);
+      if (updated) { list.items = before.items; list.updated = before.updated; } else delete saved[list.code];
+      return err(res, 500, 'Could not save right now. Please try again.');
+    }
+    return json(res, { code: list.code, token, updated, count: items.length });
+  }
+  if (sub === '/load-saved' && req.method === 'POST') {
+    const f = lookupSaved(ip, b.code);
+    if (!f.list) return err(res, f.status, f.msg);
+    room.restaurants = freshRestaurants(f.list);
+    room.voters = {};
+    room.restaurants.forEach(r => { r.id = room.nextId++; });
+    changed(room);
+    return json(res, { ...snap(room, validVoter(b.voter) ? b.voter : null), loadedCode: f.list.code });
+  }
 
   // --- restaurants ---
   if (sub === '/restaurants' && req.method === 'POST') {

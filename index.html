@@ -9,6 +9,7 @@ button.go{background:#e8590c;color:#fff;font-weight:600}
 button:disabled{opacity:.5}
 input{padding:12px;border:2px solid #ddd;border-radius:10px;font-size:1.6em;width:5.5ch;text-align:center;letter-spacing:.3em;font-variant-numeric:tabular-nums}
 input:focus{outline:none;border-color:#e8590c}
+input.scode{width:8.5ch;text-transform:uppercase;letter-spacing:.2em;font-variant-numeric:normal}
 .or{color:#999;margin:4px 0}
 .err{color:#c92a2a;min-height:1.4em;margin-top:8px}
 .code{font-size:3.4em;font-weight:800;letter-spacing:.15em;color:#e8590c;font-variant-numeric:tabular-nums;margin:6px 0}
@@ -42,7 +43,16 @@ input:focus{outline:none;border-color:#e8590c}
   <button class="go" id="jbtn" style="margin-left:6px;vertical-align:middle">Join</button>
   <div class="err" id="jerr"></div>
 </form>
-<div class="hint">Rooms last 24 hours.</div>
+<div class="or">— or —</div>
+
+<form class="card" id="open">
+  <div style="margin-bottom:10px">📂 Open a saved list</div>
+  <input class="scode" id="scode" maxlength="7" placeholder="ABC234" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="6-character saved list code">
+  <button class="go" id="obtn" style="margin-left:6px;vertical-align:middle">Open</button>
+  <div class="err" id="oerr"></div>
+  <div class="hint" style="margin-top:2px">Loads your saved restaurants into a new room with fresh votes.</div>
+</form>
+<div class="hint">Rooms last 24 hours. Saved lists never expire.</div>
 </main><script>
 const $=id=>document.getElementById(id);
 let made=null;
@@ -82,6 +92,20 @@ $('join').onsubmit=async e=>{
     location.href='/r/'+c;
   }catch{$('jerr').textContent='Network error — please try again'}
   finally{$('jbtn').disabled=false}
+};
+$('scode').oninput=e=>{e.target.value=e.target.value.toUpperCase().replace(/[^A-Z0-9-]/g,'').slice(0,7);$('oerr').textContent=''};
+$('open').onsubmit=async e=>{
+  e.preventDefault();const c=$('scode').value.replace(/-/g,'');
+  if(!/^[A-Z0-9]{6}$/.test(c)){$('oerr').textContent='Enter the 6-character saved list code.';return}
+  $('obtn').disabled=true;
+  try{
+    const r=await fetch('/api/rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({saved:c})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){$('oerr').textContent=r.status===404?'No saved list with code '+c+'. Check the code and try again.':(d.error||'Something went wrong. Please try again.');return}
+    try{const f=JSON.parse(localStorage.savedFor||'{}');f[d.code]=d.savedCode;localStorage.savedFor=JSON.stringify(f);localStorage.lastRoom=JSON.stringify({code:d.code,expires:d.expires})}catch{}
+    location.href='/r/'+d.code;
+  }catch{$('oerr').textContent='Network error — please try again'}
+  finally{$('obtn').disabled=false}
 };
 (async()=>{try{
   const l=JSON.parse(localStorage.lastRoom||'null');if(!l||!/^\d{4}$/.test(l.code))return;

@@ -2,3 +2,6 @@ data.json
 tunnel.log
 server.log
 node_modules
+saved-lists.json
+*.tmp
+.write-test-*
