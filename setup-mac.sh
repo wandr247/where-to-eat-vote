@@ -4,8 +4,10 @@ set -e
 DIR="$HOME/where-to-eat-vote"
 
 command -v brew >/dev/null || { echo "Install Homebrew first: https://brew.sh"; exit 1; }
-brew install node cloudflared >/dev/null 2>&1 || brew install node cloudflared
+echo "==> Installing Node and cloudflared with Homebrew (first run can take a few minutes)..."
+brew install node cloudflared
 
+echo "==> Downloading the app..."
 if [ -d "$DIR/.git" ]; then git -C "$DIR" pull; else git clone https://github.com/wandr247/where-to-eat-vote "$DIR"; fi
 cd "$DIR"
 
