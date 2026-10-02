@@ -7,6 +7,7 @@ catch (e) { console.error('This app needs Node 22.5 or newer (built-in node:sqli
 
 const PORT = +process.env.PORT || 3000;
 // All persistent storage lives under DATA_DIR (default: the app folder). On Railway mount a volume at /data and set DATA_DIR=/data.
+let DATA_DIR_OK = true;
 function resolveDataDir() {
   const want = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : __dirname;
   for (const dir of [want, __dirname]) {
@@ -14,6 +15,7 @@ function resolveDataDir() {
       fs.mkdirSync(dir, { recursive: true });
       const probe = path.join(dir, '.write-test-' + process.pid);
       fs.writeFileSync(probe, 'ok'); fs.unlinkSync(probe);
+      if (dir !== want) DATA_DIR_OK = false;
       if (dir !== want) console.error(`DATA_DIR ${want} is not usable; falling back to ${dir} (data will NOT persist across redeploys)`);
       return dir;
     } catch (e) { console.error('data dir not usable:', dir, e.message); }
@@ -383,7 +385,7 @@ http.createServer(async (req, res) => {
     }
     if (url === '/wheel') { res.writeHead(302, { Location: '/' }); return res.end(); }
     if (url === '/healthz') {
-      try { return json(res, { ok: true, db: 'sqlite', rooms: Object.keys(rooms).length, saved: q.savedCount.get().n }); }
+      try { return json(res, { ok: true, db: 'sqlite', persistent: DATA_DIR_OK, rooms: Object.keys(rooms).length, saved: q.savedCount.get().n }); }
       catch (e) { return json(res, { ok: false, error: 'database unavailable' }, 503); }
     }
     if (url === '/api/time') return json(res, { now: Date.now() });
