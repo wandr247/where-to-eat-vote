@@ -21,7 +21,7 @@ const DB = process.env.DATA_FILE || path.join(DATA_DIR, 'data.json');
 const SAVED_DB = path.join(DATA_DIR, 'saved-lists.json');
 const TTL_MS = +process.env.ROOM_TTL_MS || 24 * 60 * 60 * 1000;   // room lifetime (24h)
 const MAX_ROOMS = +process.env.MAX_ROOMS || 500;
-const MAX_RESTAURANTS = 50, MAX_WHEEL = 30, MAX_VOTERS = 1000, MAX_CLIENTS_PER_ROOM = 200;
+const MAX_RESTAURANTS = 50, MAX_VOTERS = 1000, MAX_CLIENTS_PER_ROOM = 200;
 const SPIN_LEAD_MS = 600, SPIN_DURATION_MS = 5000;
 const CREATE_LIMIT = +process.env.CREATE_LIMIT || 60;              // rooms per IP per hour
 const MAX_SAVED = +process.env.MAX_SAVED || 5000, MAX_SAVED_ITEMS = 50;
@@ -35,6 +35,28 @@ try {
   const d = JSON.parse(fs.readFileSync(DB, 'utf8'));
   if (d && d.rooms && typeof d.rooms === 'object') rooms = d.rooms;
 } catch {}
+// Normalise persisted rooms (older versions kept a separate wheel item list, which is now ignored:
+// the wheel always uses the room's restaurants). Never throw on odd/old data.
+function normRoom(code, r) {
+  if (!r || typeof r !== 'object' || !/^\d{4}$/.test(code) || !Number.isFinite(+r.expires)) return null;
+  const seen = new Set(), restaurants = [];
+  for (const x of Array.isArray(r.restaurants) ? r.restaurants : []) {
+    if (!x || typeof x !== 'object') continue;
+    const id = Number.isInteger(x.id) && x.id > 0 ? x.id : null, name = clean(x.name, 80);
+    if (id === null || seen.has(id) || !name) continue;
+    seen.add(id);
+    restaurants.push({ id, name, note: clean(x.note, 160), votes: Number.isFinite(x.votes) && x.votes > 0 ? Math.floor(x.votes) : 0 });
+  }
+  const voters = {};
+  if (r.voters && typeof r.voters === 'object') for (const [v, id] of Object.entries(r.voters)) if (seen.has(id)) voters[v] = id;
+  const maxId = restaurants.reduce((m, x) => Math.max(m, x.id), 0);
+  const w = r.wheel && typeof r.wheel === 'object' ? r.wheel : {};
+  return {
+    code, created: Number.isFinite(+r.created) ? +r.created : Date.now(), expires: +r.expires,
+    restaurants, nextId: Math.max(Number.isInteger(r.nextId) ? r.nextId : 0, maxId + 1), voters,
+    wheel: { angle: Number.isFinite(w.angle) ? w.angle : 0, spin: null, spinSeq: Number.isInteger(w.spinSeq) ? w.spinSeq : 0 }
+  };
+}
 const live = new Map();   // code -> Set of { res, voter }  (not persisted)
 
 let saveTimer = null;
@@ -77,7 +99,7 @@ const sameHash = (a, b) => typeof a === 'string' && typeof b === 'string' && a.l
 function purge() {
   const now = Date.now();
   for (const code of Object.keys(rooms)) {
-    if (rooms[code].expires <= now) dropRoom(code);
+    if (!rooms[code] || !(rooms[code].expires > now)) dropRoom(code);
   }
 }
 function dropRoom(code) {
@@ -100,6 +122,11 @@ const getRoom = code => {
 // ---------- helpers ----------
 const clean = (s, max) => typeof s === 'string' ? s.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max) : '';
 const validVoter = v => typeof v === 'string' && /^[A-Za-z0-9_-]{6,64}$/.test(v);
+{ // migrate persisted rooms to the current shape (needs clean() above)
+  const out = {};
+  for (const [code, r] of Object.entries(rooms)) { try { const n = normRoom(code, r); if (n) out[code] = n; } catch {} }
+  rooms = out;
+}
 
 function snap(room, voter) {
   const set = live.get(room.code);
@@ -108,7 +135,8 @@ function snap(room, voter) {
     viewers: set ? set.size : 0,
     restaurants: room.restaurants,
     mine: (voter && room.voters[voter]) || null,
-    wheel: { items: room.wheel.items, angle: room.wheel.angle, spin: room.wheel.spin }
+    // the wheel's segments are always the room's restaurants (single shared list)
+    wheel: { items: room.restaurants.map(r => ({ id: r.id, name: r.name })), angle: room.wheel.angle, spin: room.wheel.spin }
   };
 }
 function broadcast(room) {
@@ -207,10 +235,8 @@ http.createServer(async (req, res) => {
         { id: 2, name: 'Sushi Spot', note: 'Rolls and sashimi', votes: 0 },
         { id: 3, name: 'Taco Corner', note: 'Casual tacos', votes: 0 }],
       nextId: fromSaved ? MAX_SAVED_ITEMS + 1 : 4, voters: {},
-      wheel: { items: [], nextId: 1, angle: 0, spin: null, spinSeq: 0 }
+      wheel: { angle: 0, spin: null, spinSeq: 0 }
     };
-    const wnames = fromSaved ? rooms[code].restaurants.slice(0, MAX_WHEEL).map(r => clean(r.name, 40)) : ['Pizza', 'Sushi', 'Tacos'];
-    for (const n of wnames) rooms[code].wheel.items.push({ id: rooms[code].wheel.nextId++, name: n });
     save();
     return json(res, { code, expires: rooms[code].expires, now, savedCode: fromSaved ? fromSaved.code : undefined }, 201);
   }
@@ -254,7 +280,9 @@ http.createServer(async (req, res) => {
   if (b === null) return err(res, 400, 'Invalid request body');
   const ok = () => json(res, snap(room, validVoter(b.voter) ? b.voter : null));
   const spinning = () => room.wheel.spin && Date.now() < room.wheel.spin.start + room.wheel.spin.duration;
-  // once a finished spin exists, editing the wheel clears it (keeps the resting angle)
+  // list edits are blocked while the wheel is turning (its segments must not change under it)
+  const SPIN_MSG = 'The wheel is spinning — wait for it to stop';
+  // once a finished spin exists, editing the list clears it (keeps the resting angle)
   const settleSpin = () => { if (room.wheel.spin) { room.wheel.angle = room.wheel.spin.to; room.wheel.spin = null; } };
   let mm;
 
@@ -285,8 +313,10 @@ http.createServer(async (req, res) => {
     return json(res, { code: list.code, token, updated, count: items.length });
   }
   if (sub === '/load-saved' && req.method === 'POST') {
+    if (spinning()) return err(res, 409, SPIN_MSG);
     const f = lookupSaved(ip, b.code);
     if (!f.list) return err(res, f.status, f.msg);
+    settleSpin();
     room.restaurants = freshRestaurants(f.list);
     room.voters = {};
     room.restaurants.forEach(r => { r.id = room.nextId++; });
@@ -296,21 +326,26 @@ http.createServer(async (req, res) => {
 
   // --- restaurants ---
   if (sub === '/restaurants' && req.method === 'POST') {
+    if (spinning()) return err(res, 409, SPIN_MSG);
     const name = clean(b.name, 80);
     if (!name) return err(res, 400, 'Name is required');
     if (room.restaurants.length >= MAX_RESTAURANTS) return err(res, 400, `A room can have at most ${MAX_RESTAURANTS} restaurants`);
+    settleSpin();
     room.restaurants.push({ id: room.nextId++, name, note: clean(b.note, 160), votes: 0 });
     changed(room); return ok();
   }
   if ((mm = sub.match(/^\/restaurants\/(\d+)$/))) {
     const id = +mm[1], r = room.restaurants.find(x => x.id === id);
     if (!r) return err(res, 404, 'Restaurant not found');
+    if ((req.method === 'PUT' || req.method === 'DELETE') && spinning()) return err(res, 409, SPIN_MSG);
     if (req.method === 'PUT') {
+      settleSpin();
       if (b.name !== undefined) { const n = clean(b.name, 80); if (n) r.name = n; }
       if (typeof b.note === 'string') r.note = clean(b.note, 160);
       changed(room); return ok();
     }
     if (req.method === 'DELETE') {
+      settleSpin();
       room.restaurants = room.restaurants.filter(x => x.id !== id);
       for (const v in room.voters) if (room.voters[v] === id) delete room.voters[v];
       changed(room); return ok();
@@ -333,34 +368,11 @@ http.createServer(async (req, res) => {
     changed(room); return ok();
   }
 
-  // --- wheel ---
-  if (sub.startsWith('/wheel') && sub !== '/wheel/spin' && spinning()) return err(res, 409, 'The wheel is spinning — wait for it to stop');
-  if (sub === '/wheel/items' && req.method === 'POST') {
-    const name = clean(b.name, 40);
-    if (!name) return err(res, 400, 'Name is required');
-    if (room.wheel.items.length >= MAX_WHEEL) return err(res, 400, `The wheel can have at most ${MAX_WHEEL} choices`);
-    settleSpin(); room.wheel.items.push({ id: room.wheel.nextId++, name });
-    changed(room); return ok();
-  }
-  if ((mm = sub.match(/^\/wheel\/items\/(\d+)$/)) && req.method === 'DELETE') {
-    const id = +mm[1];
-    if (!room.wheel.items.some(x => x.id === id)) return err(res, 404, 'Choice not found');
-    settleSpin(); room.wheel.items = room.wheel.items.filter(x => x.id !== id);
-    changed(room); return ok();
-  }
-  if (sub === '/wheel/clear' && req.method === 'POST') {
-    settleSpin(); room.wheel.items = [];
-    changed(room); return ok();
-  }
-  if (sub === '/wheel/load' && req.method === 'POST') {
-    settleSpin();
-    room.wheel.items = room.restaurants.slice(0, MAX_WHEEL).map(r => ({ id: room.wheel.nextId++, name: clean(r.name, 40) }));
-    changed(room); return ok();
-  }
+  // --- wheel (segments = room.restaurants) ---
   if (sub === '/wheel/spin' && req.method === 'POST') {
     if (spinning()) return err(res, 409, 'The wheel is already spinning');
-    const items = room.wheel.items, n = items.length;
-    if (n < 2) return err(res, 400, 'Add at least 2 choices to spin');
+    const items = room.restaurants, n = items.length;
+    if (n < 2) return err(res, 400, 'Add at least 2 restaurants to spin');
     const TAU = 2 * Math.PI, a = TAU / n, pick = crypto.randomInt(0, n);
     const from = room.wheel.spin ? room.wheel.spin.to % TAU : room.wheel.angle % TAU;
     const jitter = (crypto.randomInt(0, 1000) / 1000 - 0.5) * a * 0.7;
@@ -369,7 +381,7 @@ http.createServer(async (req, res) => {
     const to = from + TAU * (5 + crypto.randomInt(0, 3)) + delta;
     room.wheel.spin = {
       id: ++room.wheel.spinSeq, start: Date.now() + SPIN_LEAD_MS, duration: SPIN_DURATION_MS,
-      from, to, pick, winner: items[pick].name, items: items.map(i => i.name)
+      from, to, pick, winner: items[pick].name, winnerId: items[pick].id, items: items.map(i => i.name)
     };
     changed(room); return ok();
   }

@@ -12,6 +12,7 @@ header{position:sticky;top:0;z-index:10;background:#fff;box-shadow:0 1px 6px #00
 .tabs a.on{background:#e8590c;color:#fff}
 h1{margin:.2em 0;font-size:1.5em}.sub{color:#666;margin-bottom:12px}
 .card{background:#fff;border-radius:12px;padding:14px;margin:10px 0;box-shadow:0 1px 4px #0001;position:relative;overflow:hidden}
+.card.winner{border:2px solid #2b8a3e;background:#ebfbee}
 .bar{position:absolute;left:0;top:0;bottom:0;background:#ffe3c2;z-index:0;transition:width .3s}
 .row{position:relative;z-index:1;display:flex;align-items:center;gap:10px}
 .info{flex:1;min-width:0}.name{font-weight:600;font-size:1.1em;overflow-wrap:anywhere}.note{color:#666;font-size:.9em;overflow-wrap:anywhere}
@@ -34,8 +35,11 @@ input.scode{text-transform:uppercase;letter-spacing:.15em;width:9ch}
 .wrap{position:relative;width:min(88vw,420px);margin:20px auto}
 canvas{width:100%;height:auto;display:block}
 .pin{position:absolute;top:-6px;left:50%;transform:translateX(-50%);font-size:34px;color:#222;line-height:1}
-.chips{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:10px 0}
-.chip{background:#fff;border-radius:16px;padding:4px 10px;box-shadow:0 1px 3px #0002}.chip b{cursor:pointer;margin-left:6px;color:#c00}
+.wlist{text-align:left;margin:10px 0}
+.witem{display:flex;align-items:center;gap:8px;background:#fff;border-radius:10px;padding:8px 10px;margin:6px 0;box-shadow:0 1px 3px #0001;border:2px solid transparent}
+.witem .dotc{width:12px;height:12px;border-radius:50%;flex:none}.witem .wn{flex:1;min-width:0;font-weight:600;overflow-wrap:anywhere}
+.witem .wv{color:#666;font-size:.85em;white-space:nowrap}
+.winner{border-color:#2b8a3e!important;background:#ebfbee!important}
 #result{font-size:1.5em;font-weight:700;margin:16px 0;min-height:1.5em;overflow-wrap:anywhere}
 #toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#222;color:#fff;padding:10px 16px;border-radius:10px;display:none;z-index:30;max-width:90vw}
 #gone{display:none;position:fixed;inset:0;background:#faf7f2;z-index:50;text-align:center;padding:80px 20px}
@@ -68,13 +72,12 @@ canvas{width:100%;height:auto;display:block}
 </section>
 
 <section id="wheelView" style="display:none">
-  <h1>🎡 Spin the wheel</h1><div class="sub">Everyone in the room sees the same wheel, and the same spin.</div>
-  <form id="wf"><input id="t" placeholder="Add a choice" maxlength="40"><button class="vote">Add</button></form>
-  <div class="chips" id="chips"></div>
-  <p><button id="imp">Load from vote list</button> <button id="clr">Clear</button></p>
+  <h1>🎡 Spin the wheel</h1><div class="sub">The wheel uses the same restaurant list as voting. Everyone in the room sees the same wheel, and the same spin.</div>
   <div class="wrap"><div class="pin">▼</div><canvas id="c" width="840" height="840"></canvas></div>
   <button class="go" id="spin">SPIN!</button>
   <div id="result"></div>
+  <form id="wf"><input id="t" placeholder="Add a restaurant" maxlength="80"><button class="vote">Add</button></form>
+  <div class="wlist" id="wlist"></div>
 </section>
 </main>
 <div id="toast"></div>
@@ -137,7 +140,7 @@ onpopstate=()=>setView(/\/wheel\/?$/.test(location.pathname)?'wheel':'list',fals
 // ----- state -----
 function apply(d){
   if(!d||!d.restaurants)return;
-  S=d;renderHeader();renderList();renderChips();startLoop();
+  S=d;renderHeader();renderList();renderWheelList();startLoop();
 }
 function renderHeader(){
   $('viewers').textContent=S.viewers+' here now';$('dot').className='dot on';
@@ -155,8 +158,9 @@ function renderList(){
   const max=Math.max(1,...data.map(r=>r.votes)),top=Math.max(...data.map(r=>r.votes),0);
   const leaders=data.filter(r=>r.votes===top&&top>0);
   $('lead').innerHTML=leaders.length?`<div class="lead">🏆 Leading: <b>${leaders.map(r=>esc(r.name)).join(', ')}</b> (${top} vote${top>1?'s':''})</div>`:'';
-  $('list').innerHTML=data.map(r=>`<div class="card"><div class="bar" style="width:${r.votes/max*100}%"></div><div class="row">
-  <div class="info"><div class="name">${esc(r.name)}</div><div class="note">${esc(r.note||'')}</div>
+  const wid=winnerId();
+  $('list').innerHTML=data.map(r=>`<div class="card${r.id===wid?' winner':''}"><div class="bar" style="width:${r.votes/max*100}%"></div><div class="row">
+  <div class="info"><div class="name">${r.id===wid?'🎉 ':''}${esc(r.name)}</div><div class="note">${esc(r.note||'')}</div>
   <div><button class="small" onclick="edit(${r.id})">Edit</button> <button class="small" onclick="del(${r.id})">Delete</button></div></div>
   <div class="count">${r.votes}</div><button class="vote ${mine===r.id?'mine':''}" onclick="vote(${r.id})">${mine===r.id?'✓ Voted':'Vote'}</button></div></div>`).join('')||'<p class="sub">No restaurants yet — add one below.</p>';
 }
@@ -200,7 +204,7 @@ const COLORS=['#ff6b6b','#ffa94d','#ffd43b','#69db7c','#4dabf7','#9775fa','#f783
 const cv=$('c'),ctx=cv.getContext('2d');
 function draw(angle){
   const items=S?S.wheel.items.map(i=>i.name):[],n=items.length,R=420;ctx.clearRect(0,0,840,840);
-  if(!n){ctx.fillStyle='#ddd';ctx.beginPath();ctx.arc(R,R,R-6,0,7);ctx.fill();ctx.fillStyle='#666';ctx.font='36px sans-serif';ctx.textAlign='center';ctx.fillText('Add some choices!',R,R);return}
+  if(!n){ctx.fillStyle='#ddd';ctx.beginPath();ctx.arc(R,R,R-6,0,7);ctx.fill();ctx.fillStyle='#666';ctx.font='36px sans-serif';ctx.textAlign='center';ctx.fillText('Add some restaurants!',R,R);return}
   const a=2*Math.PI/n;
   items.forEach((it,i)=>{
     const s=angle+i*a-Math.PI/2;
@@ -210,19 +214,19 @@ function draw(angle){
     ctx.font='bold '+(n>10?26:34)+'px sans-serif';ctx.fillText(it.length>16?it.slice(0,15)+'…':it,R-30,10);ctx.restore();
   });
 }
-function renderChips(){
-  $('chips').innerHTML=S.wheel.items.map(x=>`<span class="chip">${esc(x.name)}<b onclick="rmItem(${x.id})" title="Remove">×</b></span>`).join('');
+// the spin's winner (only once the wheel has stopped, so nobody gets spoiled)
+function winnerId(){const sp=S&&S.wheel.spin;return sp&&now()>=sp.start+sp.duration&&S.restaurants.some(r=>r.id===sp.winnerId)?sp.winnerId:null}
+function renderWheelList(){
+  const wid=winnerId();
+  $('wlist').innerHTML=S.restaurants.map((r,i)=>`<div class="witem${r.id===wid?' winner':''}"><span class="dotc" style="background:${COLORS[i%COLORS.length]}"></span><span class="wn">${r.id===wid?'🎉 ':''}${esc(r.name)}</span><span class="wv">${r.votes} vote${r.votes===1?'':'s'}</span><button class="small" onclick="edit(${r.id})">Edit</button><button class="small" onclick="del(${r.id})">Delete</button></div>`).join('')||'<p class="sub">No restaurants yet — add one above.</p>';
 }
-const rmItem=id=>api('DELETE','/wheel/items/'+id);
-$('wf').onsubmit=async e=>{e.preventDefault();const v=$('t').value.trim();if(!v)return;const r=await api('POST','/wheel/items',{name:v});if(r)$('t').value=''};
-$('clr').onclick=()=>api('POST','/wheel/clear');
-$('imp').onclick=()=>api('POST','/wheel/load');
+$('wf').onsubmit=async e=>{e.preventDefault();const v=$('t').value.trim();if(!v)return;const r=await api('POST','/restaurants',{name:v});if(r)$('t').value=''};
 $('spin').onclick=async()=>{
   if(!S)return;
-  if(S.wheel.items.length<2){$('result').textContent='Add at least 2 choices';return}
+  if(S.wheel.items.length<2){$('result').textContent='Add at least 2 restaurants';return}
   await api('POST','/wheel/spin');
 };
-let looping=false;const seenActive=new Set(),toasted=new Set();
+let looping=false,lastWk='';const seenActive=new Set(),toasted=new Set();
 function wheelFrame(){
   if(!S)return{active:false};
   const w=S.wheel,sp=w.spin;let angle=w.angle,active=false,done=false;
@@ -235,7 +239,8 @@ function wheelFrame(){
   draw(angle);
   const n=w.items.length;
   $('spin').disabled=active||gone;
-  $('result').textContent=done?'🎉 '+sp.winner+'!':active?'':(n<2?'Add at least 2 choices':'');
+  const wk=winnerId()+':'+(sp?sp.id:0);if(wk!==lastWk){lastWk=wk;renderList();renderWheelList()}
+  $('result').textContent=done?'🎉 '+sp.winner+'!':active?'':(n<2?'Add at least 2 restaurants':'');
   if(active&&sp)seenActive.add(sp.id);
   if(done&&seenActive.has(sp.id)&&!toasted.has(sp.id)){toasted.add(sp.id);if(view!=='wheel')toast('🎡 The wheel picked: '+sp.winner+'!',6000)}
   return{active};
