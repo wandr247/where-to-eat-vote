@@ -1,0 +1,63 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Spin the wheel</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#faf7f2;margin:0;color:#222;text-align:center}
+main{max-width:520px;margin:0 auto;padding:20px}
+nav a{color:#e8590c;font-weight:600;text-decoration:none}
+.wrap{position:relative;width:min(88vw,420px);margin:20px auto}
+canvas{width:100%;height:auto;display:block}
+.pin{position:absolute;top:-6px;left:50%;transform:translateX(-50%);font-size:34px;color:#222;line-height:1}
+button{border:0;border-radius:8px;padding:10px 16px;font-size:1em;cursor:pointer;background:#eee}
+button.go{background:#e8590c;color:#fff;font-size:1.2em;padding:12px 28px}
+button:disabled{opacity:.5}
+form{display:flex;gap:8px;justify-content:center;margin:16px 0}input{padding:10px;border:1px solid #ccc;border-radius:8px;font-size:1em;flex:1;max-width:260px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:10px 0}
+.chip{background:#fff;border-radius:16px;padding:4px 10px;box-shadow:0 1px 3px #0002}.chip b{cursor:pointer;margin-left:6px;color:#c00}
+#result{font-size:1.5em;font-weight:700;margin:16px 0;min-height:1.5em}
+</style></head><body><main>
+<nav><a href="/">← Vote page</a></nav>
+<h1>🎡 Spin the wheel</h1>
+<form id="f"><input id="t" placeholder="Add a restaurant" maxlength="40"><button>Add</button></form>
+<div class="chips" id="chips"></div>
+<p><button id="imp">Load from vote list</button> <button id="clr">Clear</button></p>
+<div class="wrap"><div class="pin">▼</div><canvas id="c" width="840" height="840"></canvas></div>
+<button class="go" id="spin">SPIN!</button>
+<div id="result"></div>
+</main><script>
+const COLORS=['#ff6b6b','#ffa94d','#ffd43b','#69db7c','#4dabf7','#9775fa','#f783ac','#38d9a9'];
+let items=JSON.parse(localStorage.wheelItems||'["Pizza","Sushi","Tacos"]'),angle=0,spinning=false;
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const save=()=>localStorage.wheelItems=JSON.stringify(items);
+function draw(){
+  const n=items.length,R=420;ctx.clearRect(0,0,840,840);
+  if(!n){ctx.fillStyle='#ddd';ctx.beginPath();ctx.arc(R,R,R-6,0,7);ctx.fill();ctx.fillStyle='#666';ctx.font='36px sans-serif';ctx.textAlign='center';ctx.fillText('Add some choices!',R,R);return}
+  const a=2*Math.PI/n;
+  items.forEach((it,i)=>{
+    const s=angle+i*a-Math.PI/2;
+    ctx.beginPath();ctx.moveTo(R,R);ctx.arc(R,R,R-6,s,s+a);ctx.closePath();
+    ctx.fillStyle=COLORS[i%COLORS.length];ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=4;ctx.stroke();
+    ctx.save();ctx.translate(R,R);ctx.rotate(s+a/2);ctx.textAlign='right';ctx.fillStyle='#222';
+    ctx.font='bold '+(n>10?26:34)+'px sans-serif';ctx.fillText(it.length>16?it.slice(0,15)+'…':it,R-30,10);ctx.restore();
+  });
+}
+function chips(){document.getElementById('chips').innerHTML=items.map((x,i)=>`<span class="chip">${x.replace(/[&<>]/g,'')}<b onclick="rm(${i})">×</b></span>`).join('');}
+function rm(i){items.splice(i,1);save();chips();draw()}
+function all(){chips();draw();save()}
+f.onsubmit=e=>{e.preventDefault();const v=t.value.trim();if(v){items.push(v);t.value='';all()}};
+clr.onclick=()=>{items=[];document.getElementById('result').textContent='';all()};
+imp.onclick=async()=>{const r=await fetch('/api/restaurants').then(r=>r.json());items=r.restaurants.map(x=>x.name);all()};
+spin.onclick=()=>{
+  if(spinning||items.length<2){if(items.length<2)result.textContent='Add at least 2 choices';return}
+  spinning=true;spin.disabled=true;result.textContent='';
+  const n=items.length,a=2*Math.PI/n,pick=Math.floor(Math.random()*n);
+  // pointer at top; segment pick center must land at angle 0 (mod 2π)
+  const target=(2*Math.PI*(5+Math.floor(Math.random()*3)))+((2*Math.PI-(pick+.5)*a)-(angle%(2*Math.PI))+2*Math.PI)%(2*Math.PI)+(Math.random()-.5)*a*.7;
+  const start=angle,dur=4500,t0=performance.now();
+  (function step(now){
+    const p=Math.min(1,(now-t0)/dur),e=1-Math.pow(1-p,3);
+    angle=start+target*e;draw();
+    if(p<1)requestAnimationFrame(step);
+    else{spinning=false;spin.disabled=false;result.textContent='🎉 '+items[pick]+'!'}
+  })(t0);
+};
+all();
+</script></body></html>

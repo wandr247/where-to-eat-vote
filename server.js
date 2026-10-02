@@ -14,6 +14,7 @@ const json = (res, o, c=200) => { res.writeHead(c, {'Content-Type':'application/
 http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
   if (req.method === 'GET' && (url === '/' || url === '/index.html')) { res.writeHead(200, {'Content-Type':'text/html'}); return res.end(fs.readFileSync(path.join(__dirname,'index.html'))); }
+  if (req.method === 'GET' && url === '/wheel') { res.writeHead(200, {'Content-Type':'text/html'}); return res.end(fs.readFileSync(path.join(__dirname,'wheel.html'))); }
   if (url === '/api/restaurants' && req.method === 'GET') return json(res, pub());
   if (url === '/api/events') { res.writeHead(200, {'Content-Type':'text/event-stream','Cache-Control':'no-cache',Connection:'keep-alive'}); res.write(`data: ${JSON.stringify(pub())}\n\n`); clients.add(res); req.on('close', () => clients.delete(res)); return; }
   if (req.method === 'POST' && url === '/api/restaurants') { const b = await body(req); const name = (b.name||'').trim().slice(0,80); if (!name) return json(res,{error:'name required'},400); state.restaurants.push({ id: state.nextId++, name, note: (b.note||'').trim().slice(0,160), votes: 0 }); save(); broadcast(); return json(res, pub()); }
