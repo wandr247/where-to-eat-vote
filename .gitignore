@@ -5,3 +5,6 @@ node_modules
 saved-lists.json
 *.tmp
 .write-test-*
+app.db
+app.db-*
+*.migrated

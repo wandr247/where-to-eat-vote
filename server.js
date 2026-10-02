@@ -1,6 +1,9 @@
 // Where should we eat? — shared rooms (zero dependencies)
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { roomImage } = require('./ogimage');
+let DatabaseSync;
+try { ({ DatabaseSync } = require('node:sqlite')); }
+catch (e) { console.error('This app needs Node 22.5 or newer (built-in node:sqlite; on 22.5-22.12 start with --experimental-sqlite). Current:', process.version); process.exit(1); }
 
 const PORT = +process.env.PORT || 3000;
 // All persistent storage lives under DATA_DIR (default: the app folder). On Railway mount a volume at /data and set DATA_DIR=/data.
@@ -18,8 +21,10 @@ function resolveDataDir() {
   return want;
 }
 const DATA_DIR = resolveDataDir();
-const DB = process.env.DATA_FILE || path.join(DATA_DIR, 'data.json');
-const SAVED_DB = path.join(DATA_DIR, 'saved-lists.json');
+const DB_FILE = process.env.DB_FILE || path.join(DATA_DIR, 'app.db');
+const OLD_ROOMS_FILE = process.env.DATA_FILE || path.join(DATA_DIR, 'data.json');       // legacy JSON files (auto-imported once)
+const OLD_SAVED_FILE = path.join(DATA_DIR, 'saved-lists.json');
+const SAVED_TTL_MS = (+process.env.SAVED_TTL_DAYS || 90) * 24 * 60 * 60 * 1000;          // saved lists unused this long are deleted
 const TTL_MS = +process.env.ROOM_TTL_MS || 24 * 60 * 60 * 1000;   // room lifetime (24h)
 const MAX_ROOMS = +process.env.MAX_ROOMS || 500;
 const MAX_RESTAURANTS = 50, MAX_VOTERS = 1000, MAX_CLIENTS_PER_ROOM = 200;
@@ -30,14 +35,62 @@ const SAVE_LIMIT = +process.env.SAVE_LIMIT || 30;                  // new saved 
 const LOOKUP_LIMIT = +process.env.LOOKUP_LIMIT || 120;             // saved-code lookups per IP per 10 minutes
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';           // no 0 O 1 I L
 
-// ---------- state ----------
-let rooms = {};   // code -> room (persisted)
-try {
-  const d = JSON.parse(fs.readFileSync(DB, 'utf8'));
-  if (d && d.rooms && typeof d.rooms === 'object') rooms = d.rooms;
-} catch {}
-// Normalise persisted rooms (older versions kept a separate wheel item list, which is now ignored:
-// the wheel always uses the room's restaurants). Never throw on odd/old data.
+// ---------- database (SQLite, built into Node) ----------
+const db = new DatabaseSync(DB_FILE);
+db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+db.exec(`
+CREATE TABLE IF NOT EXISTS rooms (
+  code TEXT PRIMARY KEY, created INTEGER NOT NULL, expires INTEGER NOT NULL,
+  next_id INTEGER NOT NULL DEFAULT 1, angle REAL NOT NULL DEFAULT 0, spin_seq INTEGER NOT NULL DEFAULT 0, spin TEXT
+);
+CREATE INDEX IF NOT EXISTS rooms_expires ON rooms(expires);
+CREATE TABLE IF NOT EXISTS restaurants (
+  room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE, id INTEGER NOT NULL, pos INTEGER NOT NULL,
+  name TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', votes INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (room_code, id)
+);
+CREATE TABLE IF NOT EXISTS voters (
+  room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE, voter TEXT NOT NULL, restaurant_id INTEGER NOT NULL, PRIMARY KEY (room_code, voter)
+);
+CREATE TABLE IF NOT EXISTS saved_lists (
+  code TEXT PRIMARY KEY, created INTEGER NOT NULL, updated INTEGER NOT NULL, last_accessed INTEGER NOT NULL, token_hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS saved_lists_accessed ON saved_lists(last_accessed);
+CREATE TABLE IF NOT EXISTS saved_items (
+  code TEXT NOT NULL REFERENCES saved_lists(code) ON DELETE CASCADE, pos INTEGER NOT NULL, name TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', PRIMARY KEY (code, pos)
+);
+`);
+function tx(fn) {   // run fn inside a transaction; roll back and rethrow on failure
+  db.exec('BEGIN IMMEDIATE');
+  try { const r = fn(); db.exec('COMMIT'); return r; }
+  catch (e) { try { db.exec('ROLLBACK'); } catch {} throw e; }
+}
+const q = {
+  roomIns: db.prepare('INSERT OR REPLACE INTO rooms (code, created, expires, next_id, angle, spin_seq, spin) VALUES (?,?,?,?,?,?,?)'),
+  roomUpd: db.prepare('UPDATE rooms SET expires = ?, next_id = ?, angle = ?, spin_seq = ?, spin = ? WHERE code = ?'),
+  roomDel: db.prepare('DELETE FROM rooms WHERE code = ?'),
+  roomsExpired: db.prepare('DELETE FROM rooms WHERE expires <= ?'),
+  restDel: db.prepare('DELETE FROM restaurants WHERE room_code = ?'),
+  restIns: db.prepare('INSERT INTO restaurants (room_code, id, pos, name, note, votes) VALUES (?,?,?,?,?,?)'),
+  votDel: db.prepare('DELETE FROM voters WHERE room_code = ?'),
+  votIns: db.prepare('INSERT INTO voters (room_code, voter, restaurant_id) VALUES (?,?,?)'),
+  roomsAll: db.prepare('SELECT * FROM rooms'),
+  restAll: db.prepare('SELECT * FROM restaurants ORDER BY room_code, pos'),
+  votAll: db.prepare('SELECT * FROM voters'),
+  roomCount: db.prepare('SELECT COUNT(*) AS n FROM rooms'),
+  savedGet: db.prepare('SELECT * FROM saved_lists WHERE code = ?'),
+  savedItems: db.prepare('SELECT name, note FROM saved_items WHERE code = ? ORDER BY pos'),
+  savedIns: db.prepare('INSERT INTO saved_lists (code, created, updated, last_accessed, token_hash) VALUES (?,?,?,?,?)'),
+  savedImport: db.prepare('INSERT OR IGNORE INTO saved_lists (code, created, updated, last_accessed, token_hash) VALUES (?,?,?,?,?)'),
+  savedTouch: db.prepare('UPDATE saved_lists SET updated = ?, last_accessed = ? WHERE code = ?'),
+  savedAccess: db.prepare('UPDATE saved_lists SET last_accessed = ? WHERE code = ?'),
+  savedItemsDel: db.prepare('DELETE FROM saved_items WHERE code = ?'),
+  savedItemIns: db.prepare('INSERT INTO saved_items (code, pos, name, note) VALUES (?,?,?,?)'),
+  savedCount: db.prepare('SELECT COUNT(*) AS n FROM saved_lists'),
+  savedStale: db.prepare('DELETE FROM saved_lists WHERE last_accessed < ?')
+};
+
+// Normalise rooms (also used when importing old JSON). Older versions kept a separate wheel item list, which is ignored:
+// the wheel always uses the room's restaurants. Never throw on odd/old data.
 function normRoom(code, r) {
   if (!r || typeof r !== 'object' || !/^\d{4}$/.test(code) || !Number.isFinite(+r.expires)) return null;
   const seen = new Set(), restaurants = [];
@@ -49,53 +102,72 @@ function normRoom(code, r) {
     restaurants.push({ id, name, note: clean(x.note, 160), votes: Number.isFinite(x.votes) && x.votes > 0 ? Math.floor(x.votes) : 0 });
   }
   const voters = {};
-  if (r.voters && typeof r.voters === 'object') for (const [v, id] of Object.entries(r.voters)) if (seen.has(id)) voters[v] = id;
+  if (r.voters && typeof r.voters === 'object') for (const [v, id] of Object.entries(r.voters)) if (seen.has(id) && validVoter(v)) voters[v] = id;
   const maxId = restaurants.reduce((m, x) => Math.max(m, x.id), 0);
   const w = r.wheel && typeof r.wheel === 'object' ? r.wheel : {};
   return {
     code, created: Number.isFinite(+r.created) ? +r.created : Date.now(), expires: +r.expires,
     restaurants, nextId: Math.max(Number.isInteger(r.nextId) ? r.nextId : 0, maxId + 1), voters,
-    wheel: { angle: Number.isFinite(w.angle) ? w.angle : 0, spin: null, spinSeq: Number.isInteger(w.spinSeq) ? w.spinSeq : 0 }
+    wheel: { angle: Number.isFinite(w.angle) ? w.angle : 0, spin: validSpin(w.spin), spinSeq: Number.isInteger(w.spinSeq) ? w.spinSeq : 0 }
   };
+}
+function validSpin(sp) {
+  return sp && typeof sp === 'object' && ['id', 'start', 'duration', 'from', 'to', 'pick', 'winnerId'].every(k => Number.isFinite(sp[k])) && typeof sp.winner === 'string' && Array.isArray(sp.items) ? sp : null;
+}
+
+// write-through: store one room (its row, restaurants and votes) in a single transaction
+function writeRoom(room, isNew) {
+  const spin = room.wheel.spin ? JSON.stringify(room.wheel.spin) : null;
+  if (isNew) q.roomIns.run(room.code, room.created, room.expires, room.nextId, room.wheel.angle, room.wheel.spinSeq, spin);
+  else q.roomUpd.run(room.expires, room.nextId, room.wheel.angle, room.wheel.spinSeq, spin, room.code);
+  q.restDel.run(room.code); q.votDel.run(room.code);
+  room.restaurants.forEach((x, i) => q.restIns.run(room.code, x.id, i, x.name, x.note, x.votes));
+  for (const [v, id] of Object.entries(room.voters)) q.votIns.run(room.code, v, id);
+}
+function persistRoom(room, isNew) {
+  try { tx(() => writeRoom(room, isNew)); return true; }
+  catch (e) { console.error('room save failed', e.message); return false; }
+}
+
+// ---------- load rooms from the database ----------
+let rooms = {};   // code -> room (in-memory copy of the database, for live sync)
+function loadRooms() {
+  const now = Date.now(), byCode = {};
+  for (const r of q.roomsAll.all()) {
+    if (!(r.expires > now)) continue;
+    let spin = null; try { spin = r.spin ? validSpin(JSON.parse(r.spin)) : null; } catch {}
+    byCode[r.code] = { code: r.code, created: r.created, expires: r.expires, nextId: r.next_id, restaurants: [], voters: {}, wheel: { angle: r.angle, spin, spinSeq: r.spin_seq } };
+  }
+  for (const x of q.restAll.all()) if (byCode[x.room_code]) byCode[x.room_code].restaurants.push({ id: x.id, name: x.name, note: x.note, votes: x.votes });
+  for (const v of q.votAll.all()) if (byCode[v.room_code]) byCode[v.room_code].voters[v.voter] = v.restaurant_id;
+  return byCode;
 }
 const live = new Map();   // code -> Set of { res, voter }  (not persisted)
 
-let saveTimer = null;
-function save() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => { saveTimer = null; saveNow(); }, 250);
-}
-// atomic + durable write: temp file, fsync, rename
-function writeAtomic(file, text) {
-  const tmp = file + '.' + process.pid + '.tmp';
-  const fd = fs.openSync(tmp, 'w');
-  try { fs.writeSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  fs.renameSync(tmp, file);
-}
-function saveNow() {
-  try { writeAtomic(DB, JSON.stringify({ rooms })); }
-  catch (e) { console.error('save failed', e.message); }
-}
-
-// ---------- saved lists (permanent) ----------
-let saved = {};   // CODE -> { code, created, updated, tokenHash, items:[{name,note}] }
-try {
-  const d = JSON.parse(fs.readFileSync(SAVED_DB, 'utf8'));
-  if (d && d.lists && typeof d.lists === 'object') saved = d.lists;
-} catch (e) { if (e.code !== 'ENOENT') console.error('could not read saved lists:', e.message); }
-function persistSaved() { writeAtomic(SAVED_DB, JSON.stringify({ lists: saved })); }   // throws on failure
+// ---------- saved lists (permanent until unused for 90 days) ----------
 const SAVED_CODE_RE = /^[A-Z2-9]{6}$/;
 const normSavedCode = s => typeof s === 'string' ? s.toUpperCase().replace(/[\s-]/g, '') : '';
 const hashToken = t => crypto.createHash('sha256').update(String(t)).digest('hex');
+const savedExists = c => !!q.savedGet.get(c);
 function newSavedCode() {
   for (let i = 0; i < 1000; i++) {
     let c = '';
     for (let k = 0; k < 6; k++) c += CODE_ALPHABET[crypto.randomInt(0, CODE_ALPHABET.length)];
-    if (!saved[c]) return c;
+    if (!savedExists(c)) return c;
   }
   return null;
 }
 const sameHash = (a, b) => typeof a === 'string' && typeof b === 'string' && a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+// fetch a saved list { code, created, updated, tokenHash, items } or null
+function getSaved(code) {
+  const row = q.savedGet.get(code);
+  if (!row) return null;
+  return { code: row.code, created: row.created, updated: row.updated, tokenHash: row.token_hash, items: q.savedItems.all(code).map(i => ({ name: i.name, note: i.note })) };
+}
+function writeSavedItems(code, items) {
+  q.savedItemsDel.run(code);
+  items.forEach((it, i) => q.savedItemIns.run(code, i, it.name, it.note || ''));
+}
 
 function purge() {
   const now = Date.now();
@@ -108,10 +180,19 @@ function dropRoom(code) {
   if (set) for (const c of set) { try { c.res.write('event: expired\ndata: {}\n\n'); c.res.end(); } catch {} }
   live.delete(code);
   delete rooms[code];
-  save();
+  try { q.roomDel.run(code); } catch (e) { console.error('room delete failed', e.message); }
+}
+// hourly + at startup: drop expired rooms and saved lists nobody has opened or updated in 90 days
+function cleanup() {
+  try {
+    purge();
+    const r1 = q.roomsExpired.run(Date.now()), r2 = q.savedStale.run(Date.now() - SAVED_TTL_MS);
+    if (r1.changes || r2.changes) console.log(`cleanup: removed ${r1.changes} expired rooms, ${r2.changes} unused saved lists`);
+    db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+  } catch (e) { console.error('cleanup failed', e.message); }
 }
 setInterval(purge, Math.max(1000, Math.min(30000, TTL_MS / 2)));
-purge();
+setInterval(cleanup, 60 * 60 * 1000);
 
 const getRoom = code => {
   const r = rooms[code];
@@ -123,11 +204,42 @@ const getRoom = code => {
 // ---------- helpers ----------
 const clean = (s, max) => typeof s === 'string' ? s.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max) : '';
 const validVoter = v => typeof v === 'string' && /^[A-Za-z0-9_-]{6,64}$/.test(v);
-{ // migrate persisted rooms to the current shape (needs clean() above)
-  const out = {};
-  for (const [code, r] of Object.entries(rooms)) { try { const n = normRoom(code, r); if (n) out[code] = n; } catch {} }
-  rooms = out;
+// ---------- one-time import of the old JSON files ----------
+function readJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (e) { if (e.code !== 'ENOENT') console.error('could not read', file, e.message); return null; }
 }
+function migrateOldFiles() {
+  const oldRooms = readJson(OLD_ROOMS_FILE), oldSaved = readJson(OLD_SAVED_FILE), now = Date.now();
+  if (!oldRooms && !oldSaved) return;
+  let nr = 0, ns = 0;
+  tx(() => {
+    if (oldRooms && oldRooms.rooms && typeof oldRooms.rooms === 'object') {
+      for (const [code, r] of Object.entries(oldRooms.rooms)) {
+        let n = null; try { n = normRoom(code, r); } catch {}
+        if (!n || !(n.expires > now) || q.roomCount.get().n > 100000) continue;
+        if (db.prepare('SELECT 1 FROM rooms WHERE code = ?').get(code)) continue;
+        writeRoom(n, true); nr++;
+      }
+    }
+    if (oldSaved && oldSaved.lists && typeof oldSaved.lists === 'object') {
+      for (const [code, l] of Object.entries(oldSaved.lists)) {
+        if (!SAVED_CODE_RE.test(code) || !l || typeof l.tokenHash !== 'string' || !Array.isArray(l.items)) continue;
+        const items = l.items.map(i => ({ name: clean(i && i.name, 80), note: clean(i && i.note, 160) })).filter(i => i.name).slice(0, MAX_SAVED_ITEMS);
+        const created = Number.isFinite(+l.created) ? +l.created : now, updated = Number.isFinite(+l.updated) ? +l.updated : created;
+        if (q.savedImport.run(code, created, updated, now, l.tokenHash).changes) { writeSavedItems(code, items); ns++; }
+      }
+    }
+  });
+  // only reached if the import committed; keep the originals as *.migrated
+  for (const f of [OLD_ROOMS_FILE, OLD_SAVED_FILE]) {
+    try { if (fs.existsSync(f)) fs.renameSync(f, f + '.migrated'); } catch (e) { console.error('could not rename', f, e.message); }
+  }
+  console.log(`migrated old data files: ${nr} rooms, ${ns} saved lists`);
+}
+try { migrateOldFiles(); } catch (e) { console.error('migration failed (old files left in place, will retry on next start):', e.message); }
+rooms = loadRooms();
+cleanup();
 
 function snap(room, voter) {
   const set = live.get(room.code);
@@ -145,7 +257,7 @@ function broadcast(room) {
   if (!set) return;
   for (const c of set) { try { c.res.write(`data: ${JSON.stringify(snap(room, c.voter))}\n\n`); } catch {} }
 }
-function changed(room) { save(); broadcast(room); }
+function changed(room) { persistRoom(room, false); broadcast(room); }
 
 function readBody(req) {
   return new Promise(resolve => {
@@ -235,8 +347,9 @@ function lookupSaved(ip, raw) {
   if (!allowed('lookup', ip, LOOKUP_LIMIT, 600000)) return { status: 429, msg: 'Too many attempts. Please wait a few minutes and try again.' };
   const c = normSavedCode(raw);
   if (!SAVED_CODE_RE.test(c)) return { status: 400, msg: 'Saved list codes are 6 characters (letters and numbers).' };
-  const list = Object.prototype.hasOwnProperty.call(saved, c) ? saved[c] : null;
+  const list = getSaved(c);
   if (!list) return { status: 404, msg: `No saved list with code ${c}. Check the code and try again.` };
+  try { q.savedAccess.run(Date.now(), c); } catch (e) { console.error('last_accessed update failed', e.message); }   // keeps the list from being cleaned up
   return { list };
 }
 const freshRestaurants = list => list.items.slice(0, MAX_SAVED_ITEMS).map((it, i) => ({ id: i + 1, name: clean(it.name, 80), note: clean(it.note, 160), votes: 0 })).filter(r => r.name);
@@ -269,7 +382,10 @@ http.createServer(async (req, res) => {
       } catch (e) { console.error('og image failed', e.message); res.writeHead(500, { 'Content-Type': 'text/plain' }); return res.end('Image unavailable'); }
     }
     if (url === '/wheel') { res.writeHead(302, { Location: '/' }); return res.end(); }
-    if (url === '/healthz') return json(res, { ok: true, rooms: Object.keys(rooms).length, saved: Object.keys(saved).length });
+    if (url === '/healthz') {
+      try { return json(res, { ok: true, db: 'sqlite', rooms: Object.keys(rooms).length, saved: q.savedCount.get().n }); }
+      catch (e) { return json(res, { ok: false, error: 'database unavailable' }, 503); }
+    }
     if (url === '/api/time') return json(res, { now: Date.now() });
   }
 
@@ -296,7 +412,7 @@ http.createServer(async (req, res) => {
       nextId: fromSaved ? MAX_SAVED_ITEMS + 1 : 1, voters: {},
       wheel: { angle: 0, spin: null, spinSeq: 0 }
     };
-    save();
+    if (!persistRoom(rooms[code], true)) { delete rooms[code]; return err(res, 500, 'Could not create a room right now. Please try again.'); }
     return json(res, { code, expires: rooms[code].expires, now, savedCode: fromSaved ? fromSaved.code : undefined }, 201);
   }
 
@@ -351,22 +467,22 @@ http.createServer(async (req, res) => {
     if (!items.length) return err(res, 400, 'Add at least one restaurant before saving');
     if (!allowed('save', ip, SAVE_LIMIT, 3600000)) return err(res, 429, 'Too many saves from your network. Try again later.');
     const now = Date.now();
-    const prevCode = normSavedCode(b.savedCode), prev = SAVED_CODE_RE.test(prevCode) && Object.prototype.hasOwnProperty.call(saved, prevCode) ? saved[prevCode] : null;
-    let list, updated = false, token = null, before = null;
-    if (prev && typeof b.token === 'string' && b.token.length >= 16 && b.token.length <= 128 && sameHash(prev.tokenHash, hashToken(b.token))) {
-      list = prev; updated = true; before = { items: prev.items, updated: prev.updated };
-      list.items = items; list.updated = now;
-    } else {
-      if (Object.keys(saved).length >= MAX_SAVED) return err(res, 503, 'Saved lists are full right now. Please try again later.');
-      const c = newSavedCode();
-      if (!c) return err(res, 503, 'Could not create a code right now. Please try again.');
-      token = crypto.randomBytes(24).toString('base64url');
-      list = saved[c] = { code: c, created: now, updated: now, tokenHash: hashToken(token), items };
-    }
-    try { persistSaved(); }
-    catch (e) {
+    const prevCode = normSavedCode(b.savedCode), prev = SAVED_CODE_RE.test(prevCode) ? getSaved(prevCode) : null;
+    let list, updated = false, token = null;
+    try {
+      if (prev && typeof b.token === 'string' && b.token.length >= 16 && b.token.length <= 128 && sameHash(prev.tokenHash, hashToken(b.token))) {
+        list = prev; updated = true;
+        tx(() => { q.savedTouch.run(now, now, prev.code); writeSavedItems(prev.code, items); });
+      } else {
+        if (q.savedCount.get().n >= MAX_SAVED) return err(res, 503, 'Saved lists are full right now. Please try again later.');
+        const c = newSavedCode();
+        if (!c) return err(res, 503, 'Could not create a code right now. Please try again.');
+        token = crypto.randomBytes(24).toString('base64url');
+        list = { code: c };
+        tx(() => { q.savedIns.run(c, now, now, now, hashToken(token)); writeSavedItems(c, items); });
+      }
+    } catch (e) {
       console.error('saved-lists write failed', e.message);
-      if (updated) { list.items = before.items; list.updated = before.updated; } else delete saved[list.code];
       return err(res, 500, 'Could not save right now. Please try again.');
     }
     return json(res, { code: list.code, token, updated, count: items.length });
@@ -448,4 +564,4 @@ http.createServer(async (req, res) => {
   return err(res, 404, 'Not found');
 }).listen(PORT, '0.0.0.0', () => console.log('listening on', PORT));
 
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { saveNow(); process.exit(0); });
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { try { db.close(); } catch {} process.exit(0); });
