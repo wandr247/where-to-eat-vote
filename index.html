@@ -1,42 +1,91 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Where should we eat?</title>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Where should we eat?</title><link rel="icon" href="data:,">
 <style>
 body{font-family:system-ui,sans-serif;background:#faf7f2;margin:0;color:#222}
-main{max-width:640px;margin:0 auto;padding:20px}
-h1{margin:.2em 0}.sub{color:#666;margin-bottom:16px}
-.card{background:#fff;border-radius:12px;padding:14px;margin:10px 0;box-shadow:0 1px 4px #0001;position:relative;overflow:hidden}
-.bar{position:absolute;left:0;top:0;bottom:0;background:#ffe3c2;z-index:0;transition:width .3s}
-.row{position:relative;z-index:1;display:flex;align-items:center;gap:10px}
-.info{flex:1}.name{font-weight:600;font-size:1.1em}.note{color:#666;font-size:.9em}
-.count{font-size:1.6em;font-weight:700;min-width:2ch;text-align:center}
-button{border:0;border-radius:8px;padding:8px 12px;font-size:1em;cursor:pointer;background:#eee}
-button.vote{background:#e8590c;color:#fff}button.vote.mine{background:#2b8a3e}
-.small{font-size:.8em;padding:4px 8px}
-form{display:flex;gap:8px;flex-wrap:wrap;margin-top:20px}input{padding:8px;border:1px solid #ccc;border-radius:8px;font-size:1em}
-.lead{background:#fff3bf;padding:8px 12px;border-radius:8px;margin:10px 0}
+main{max-width:520px;margin:0 auto;padding:20px;text-align:center}
+h1{margin:.4em 0 .1em}.sub{color:#666;margin-bottom:24px}
+.card{background:#fff;border-radius:14px;padding:20px;margin:16px 0;box-shadow:0 1px 4px #0001}
+button{border:0;border-radius:10px;padding:12px 18px;font-size:1.05em;cursor:pointer;background:#eee}
+button.go{background:#e8590c;color:#fff;font-weight:600}
+button:disabled{opacity:.5}
+input{padding:12px;border:2px solid #ddd;border-radius:10px;font-size:1.6em;width:5.5ch;text-align:center;letter-spacing:.3em;font-variant-numeric:tabular-nums}
+input:focus{outline:none;border-color:#e8590c}
+.or{color:#999;margin:4px 0}
+.err{color:#c92a2a;min-height:1.4em;margin-top:8px}
+.code{font-size:3.4em;font-weight:800;letter-spacing:.15em;color:#e8590c;font-variant-numeric:tabular-nums;margin:6px 0}
+.link{word-break:break-all;color:#555;font-size:.9em;margin:6px 0 12px}
+.row{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+#made,#again{display:none}
+.hint{color:#777;font-size:.85em;margin-top:10px}
 </style></head><body><main>
-<h1>🍽️ Where should we eat?</h1><div class="sub">Tap Vote on your pick. Tap again to undo, or choose another to switch. Counts update live.</div>
-<p><a href="/wheel">🎡 Can't decide? Spin the wheel →</a></p><div id="lead"></div><div id="list"></div>
-<form id="add"><input id="n" placeholder="Restaurant name" required><input id="d" placeholder="Note (optional)"><button class="vote">Add restaurant</button></form>
-<p><button class="small" id="reset">Reset all votes</button></p>
+<h1>🍽️ Where should we eat?</h1>
+<div class="sub">Make a room, share the 4-digit code, and decide together — vote on a list or spin a wheel, live.</div>
+
+<div class="card" id="again"><div>Your recent room: <b id="againCode"></b></div><p><button class="go" id="againBtn">Rejoin</button></p></div>
+
+<div class="card">
+  <button class="go" id="create" style="font-size:1.2em;padding:14px 26px">➕ Create a room</button>
+  <div class="err" id="cerr"></div>
+  <div id="made">
+    <div>Share this code:</div>
+    <div class="code" id="mcode"></div>
+    <div class="link" id="mlink"></div>
+    <div class="row"><button id="mcopy">📋 Copy code</button><button id="mshare">🔗 Share link</button><button class="go" id="menter">Enter room →</button></div>
+    <div class="hint" id="mexp"></div>
+  </div>
+</div>
+
+<div class="or">— or —</div>
+
+<form class="card" id="join">
+  <div style="margin-bottom:10px">Have a code?</div>
+  <input id="code" inputmode="numeric" pattern="\d{4}" maxlength="4" placeholder="0000" autocomplete="off" aria-label="4-digit room code">
+  <button class="go" id="jbtn" style="margin-left:6px;vertical-align:middle">Join</button>
+  <div class="err" id="jerr"></div>
+</form>
+<div class="hint">Rooms last 24 hours.</div>
 </main><script>
-let voter=localStorage.voter||(localStorage.voter=Math.random().toString(36).slice(2)+Date.now().toString(36));
-let data=[],mine=null;
-const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const api=(m,u,b)=>fetch(u,{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined}).then(r=>r.json());
-function render(){
-  const max=Math.max(1,...data.map(r=>r.votes)),top=Math.max(...data.map(r=>r.votes),0);
-  const leaders=data.filter(r=>r.votes===top&&top>0);
-  document.getElementById('lead').innerHTML=leaders.length?`<div class="lead">🏆 Leading: <b>${leaders.map(r=>esc(r.name)).join(', ')}</b> (${top} vote${top>1?'s':''})</div>`:'';
-  document.getElementById('list').innerHTML=data.map(r=>`<div class="card"><div class="bar" style="width:${r.votes/max*100}%"></div><div class="row">
-  <div class="info"><div class="name">${esc(r.name)}</div><div class="note">${esc(r.note||'')}</div>
-  <div><button class="small" onclick="edit(${r.id})">Edit</button> <button class="small" onclick="del(${r.id})">Delete</button></div></div>
-  <div class="count">${r.votes}</div><button class="vote ${mine===r.id?'mine':''}" onclick="vote(${r.id})">${mine===r.id?'✓ Voted':'Vote'}</button></div></div>`).join('');
-}
-async function vote(id){const r=await api('POST','/api/vote',{id,voter});data=r.restaurants;mine=r.mine;render()}
-async function edit(id){const r=data.find(x=>x.id===id);const n=prompt('Name',r.name);if(n===null)return;const d=prompt('Note',r.note||'');await api('PUT','/api/restaurants/'+id,{name:n,note:d===null?r.note:d})}
-async function del(id){if(confirm('Delete this restaurant?'))await api('DELETE','/api/restaurants/'+id)}
-document.getElementById('add').onsubmit=async e=>{e.preventDefault();await api('POST','/api/restaurants',{name:n.value,note:d.value});n.value=d.value=''};
-document.getElementById('reset').onclick=()=>{if(confirm('Reset all votes?'))api('POST','/api/reset')};
-fetch('/api/mine?voter='+voter).then(r=>r.json()).then(r=>{mine=r.mine;render()});
-const es=new EventSource('/api/events');es.onmessage=e=>{data=JSON.parse(e.data).restaurants;if(mine&&!data.find(r=>r.id===mine))mine=null;render()};
+const $=id=>document.getElementById(id);
+let made=null;
+const roomUrl=c=>location.origin+'/r/'+c;
+async function copy(text){try{await navigator.clipboard.writeText(text);return true}catch{const t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();let ok=false;try{ok=document.execCommand('copy')}catch{}t.remove();return ok}}
+function flash(btn,txt){const o=btn.textContent;btn.textContent=txt;setTimeout(()=>btn.textContent=o,1500)}
+$('create').onclick=async()=>{
+  $('cerr').textContent='';$('create').disabled=true;
+  try{
+    const r=await fetch('/api/rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const d=await r.json();
+    if(!r.ok){$('cerr').textContent=d.error||'Could not create a room';return}
+    made=d;localStorage.lastRoom=JSON.stringify({code:d.code,expires:d.expires});
+    $('mcode').textContent=d.code;$('mlink').textContent=roomUrl(d.code);
+    $('mexp').textContent='Expires '+new Date(d.expires).toLocaleString()+' (24 hours)';
+    $('made').style.display='block';
+  }catch{$('cerr').textContent='Network error — please try again'}
+  finally{$('create').disabled=false}
+};
+$('mcopy').onclick=async()=>{await copy(made.code);flash($('mcopy'),'Copied!')};
+$('mshare').onclick=async()=>{
+  const url=roomUrl(made.code);
+  if(navigator.share){try{await navigator.share({title:'Where should we eat?',text:'Join my room — code '+made.code,url});return}catch(e){if(e.name==='AbortError')return}}
+  await copy(url);flash($('mshare'),'Link copied!');
+};
+$('menter').onclick=()=>location.href='/r/'+made.code;
+$('code').oninput=e=>{e.target.value=e.target.value.replace(/\D/g,'').slice(0,4);$('jerr').textContent=''};
+$('join').onsubmit=async e=>{
+  e.preventDefault();const c=$('code').value;
+  if(!/^\d{4}$/.test(c)){$('jerr').textContent='Enter the 4-digit code (numbers only).';return}
+  $('jbtn').disabled=true;
+  try{
+    const r=await fetch('/api/rooms/'+c);
+    if(r.status===404){$('jerr').textContent='No active room with code '+c+'. It may have expired (rooms last 24 hours) — check the code or create a new room.';return}
+    if(!r.ok){$('jerr').textContent='Something went wrong. Please try again.';return}
+    localStorage.lastRoom=JSON.stringify({code:c});
+    location.href='/r/'+c;
+  }catch{$('jerr').textContent='Network error — please try again'}
+  finally{$('jbtn').disabled=false}
+};
+(async()=>{try{
+  const l=JSON.parse(localStorage.lastRoom||'null');if(!l||!/^\d{4}$/.test(l.code))return;
+  const r=await fetch('/api/rooms/'+l.code);if(!r.ok){localStorage.removeItem('lastRoom');return}
+  $('againCode').textContent=l.code;$('again').style.display='block';$('againBtn').onclick=()=>location.href='/r/'+l.code;
+}catch{}})();
 </script></body></html>

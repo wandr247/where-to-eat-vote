@@ -1,0 +1,221 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Room — Where should we eat?</title><link rel="icon" href="data:,">
+<style>
+body{font-family:system-ui,sans-serif;background:#faf7f2;margin:0;color:#222}
+main{max-width:640px;margin:0 auto;padding:0 20px 40px}
+header{position:sticky;top:0;z-index:10;background:#fff;box-shadow:0 1px 6px #0002;padding:8px 16px}
+.hin{max-width:640px;margin:0 auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.hcode{font-size:1.9em;font-weight:800;letter-spacing:.12em;color:#e8590c;font-variant-numeric:tabular-nums;line-height:1}
+.hlabel{font-size:.7em;color:#888;letter-spacing:0;font-weight:600;display:block}
+.hmeta{flex:1;min-width:120px;font-size:.8em;color:#666;text-align:right}
+.tabs{display:flex;gap:6px;margin:14px 0}
+.tabs a{flex:1;text-align:center;padding:10px;border-radius:10px;background:#eee;color:#222;text-decoration:none;font-weight:600}
+.tabs a.on{background:#e8590c;color:#fff}
+h1{margin:.2em 0;font-size:1.5em}.sub{color:#666;margin-bottom:12px}
+.card{background:#fff;border-radius:12px;padding:14px;margin:10px 0;box-shadow:0 1px 4px #0001;position:relative;overflow:hidden}
+.bar{position:absolute;left:0;top:0;bottom:0;background:#ffe3c2;z-index:0;transition:width .3s}
+.row{position:relative;z-index:1;display:flex;align-items:center;gap:10px}
+.info{flex:1;min-width:0}.name{font-weight:600;font-size:1.1em;overflow-wrap:anywhere}.note{color:#666;font-size:.9em;overflow-wrap:anywhere}
+.count{font-size:1.6em;font-weight:700;min-width:2ch;text-align:center}
+button{border:0;border-radius:8px;padding:8px 12px;font-size:1em;cursor:pointer;background:#eee}
+button.vote{background:#e8590c;color:#fff}button.vote.mine{background:#2b8a3e}
+button.go{background:#e8590c;color:#fff;font-size:1.2em;padding:12px 28px}
+button:disabled{opacity:.5;cursor:default}
+.small{font-size:.8em;padding:4px 8px}
+form{display:flex;gap:8px;flex-wrap:wrap;margin-top:20px}input{padding:8px;border:1px solid #ccc;border-radius:8px;font-size:1em}
+.lead{background:#fff3bf;padding:8px 12px;border-radius:8px;margin:10px 0}
+#wheelView{text-align:center}
+#wheelView form{justify-content:center;margin:16px 0}#wheelView form input{flex:1;max-width:260px;padding:10px}
+.wrap{position:relative;width:min(88vw,420px);margin:20px auto}
+canvas{width:100%;height:auto;display:block}
+.pin{position:absolute;top:-6px;left:50%;transform:translateX(-50%);font-size:34px;color:#222;line-height:1}
+.chips{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:10px 0}
+.chip{background:#fff;border-radius:16px;padding:4px 10px;box-shadow:0 1px 3px #0002}.chip b{cursor:pointer;margin-left:6px;color:#c00}
+#result{font-size:1.5em;font-weight:700;margin:16px 0;min-height:1.5em;overflow-wrap:anywhere}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#222;color:#fff;padding:10px 16px;border-radius:10px;display:none;z-index:30;max-width:90vw}
+#gone{display:none;position:fixed;inset:0;background:#faf7f2;z-index:50;text-align:center;padding:80px 20px}
+#gone a{display:inline-block;margin-top:16px;background:#e8590c;color:#fff;padding:12px 22px;border-radius:10px;text-decoration:none;font-weight:600}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#bbb;margin-right:4px}.dot.on{background:#2b8a3e}
+</style></head><body>
+<header><div class="hin">
+  <div class="hcode"><span class="hlabel">ROOM CODE</span><span id="hc">----</span></div>
+  <button class="small" id="copyc">📋 Copy code</button><button class="small" id="share">🔗 Share link</button>
+  <div class="hmeta"><div><span class="dot" id="dot"></span><span id="viewers">connecting…</span></div><div id="exp"></div></div>
+</div></header>
+<main>
+<div class="tabs"><a href="#" id="tList">🗳️ List voting</a><a href="#" id="tWheel">🎡 Wheel</a></div>
+
+<section id="listView">
+  <h1>🍽️ Where should we eat?</h1><div class="sub">Tap Vote on your pick. Tap again to undo, or choose another to switch. Everyone in the room sees changes live.</div>
+  <div id="lead"></div><div id="list"></div>
+  <form id="add"><input id="n" placeholder="Restaurant name" maxlength="80" required><input id="d" placeholder="Note (optional)" maxlength="160"><button class="vote">Add restaurant</button></form>
+  <p><button class="small" id="reset">Reset all votes</button></p>
+</section>
+
+<section id="wheelView" style="display:none">
+  <h1>🎡 Spin the wheel</h1><div class="sub">Everyone in the room sees the same wheel, and the same spin.</div>
+  <form id="wf"><input id="t" placeholder="Add a choice" maxlength="40"><button class="vote">Add</button></form>
+  <div class="chips" id="chips"></div>
+  <p><button id="imp">Load from vote list</button> <button id="clr">Clear</button></p>
+  <div class="wrap"><div class="pin">▼</div><canvas id="c" width="840" height="840"></canvas></div>
+  <button class="go" id="spin">SPIN!</button>
+  <div id="result"></div>
+</section>
+</main>
+<div id="toast"></div>
+<div id="gone"><h1>⏰ This room is gone</h1><p id="gonemsg">It doesn't exist or has expired (rooms last 24 hours).</p><a href="/">Create or join a room</a></div>
+<script>
+const $=id=>document.getElementById(id);
+const m=location.pathname.match(/^\/r\/(\d{4})(\/wheel)?\/?$/);
+const code=m[1];let view=m[2]?'wheel':'list';
+const voter=localStorage.voter&&/^[A-Za-z0-9_-]{6,64}$/.test(localStorage.voter)?localStorage.voter:(localStorage.voter=Math.random().toString(36).slice(2)+Date.now().toString(36));
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const base='/api/rooms/'+code;
+let S=null,offset=0,bestRtt=1e9,gone=false;
+const now=()=>Date.now()+offset;
+$('hc').textContent=code;document.title='Room '+code+' — Where should we eat?';
+try{localStorage.lastRoom=JSON.stringify({code})}catch{}
+
+// ----- helpers -----
+let toastT;function toast(t,ms=3500){const e=$('toast');e.textContent=t;e.style.display='block';clearTimeout(toastT);toastT=setTimeout(()=>e.style.display='none',ms)}
+async function api(method,path,body){
+  try{
+    const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify({...(body||{}),voter})});
+    const d=await r.json().catch(()=>({}));
+    if(r.status===404&&/Room/.test(d.error||''))return showGone();
+    if(!r.ok){toast(d.error||'Something went wrong');return null}
+    apply(d);return d;
+  }catch{toast('Network error');return null}
+}
+async function copy(text){try{await navigator.clipboard.writeText(text);return true}catch{const t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();let ok=false;try{ok=document.execCommand('copy')}catch{}t.remove();return ok}}
+$('copyc').onclick=async()=>{await copy(code);toast('Code '+code+' copied')};
+$('share').onclick=async()=>{
+  const url=location.origin+'/r/'+code+(view==='wheel'?'/wheel':'');
+  if(navigator.share){try{await navigator.share({title:'Where should we eat?',text:'Join my room — code '+code,url});return}catch(e){if(e.name==='AbortError')return}}
+  await copy(url);toast('Link copied: '+url);
+};
+function showGone(){gone=true;$('gone').style.display='block';if(es)es.close();return null}
+
+// ----- server clock sync (lowest-RTT sample wins) -----
+async function syncTime(n=5){
+  for(let i=0;i<n;i++){
+    try{const t0=Date.now();const r=await fetch('/api/time?'+t0+i,{cache:'no-store'});const d=await r.json();const t1=Date.now(),rtt=t1-t0;
+      if(rtt<bestRtt){bestRtt=rtt;offset=d.now-(t0+rtt/2)}}catch{}
+    await new Promise(r=>setTimeout(r,120));
+  }
+  startLoop();
+}
+setInterval(()=>{bestRtt=1e9;syncTime(4)},60000);
+
+// ----- views -----
+function setView(v,push){
+  view=v;
+  $('listView').style.display=v==='list'?'':'none';$('wheelView').style.display=v==='wheel'?'':'none';
+  $('tList').classList.toggle('on',v==='list');$('tWheel').classList.toggle('on',v==='wheel');
+  if(push)history.pushState({},'','/r/'+code+(v==='wheel'?'/wheel':''));
+  if(v==='wheel')startLoop();
+}
+$('tList').onclick=e=>{e.preventDefault();setView('list',true)};
+$('tWheel').onclick=e=>{e.preventDefault();setView('wheel',true)};
+onpopstate=()=>setView(/\/wheel\/?$/.test(location.pathname)?'wheel':'list',false);
+
+// ----- state -----
+function apply(d){
+  if(!d||!d.restaurants)return;
+  S=d;renderHeader();renderList();renderChips();startLoop();
+}
+function renderHeader(){
+  $('viewers').textContent=S.viewers+' here now';$('dot').className='dot on';
+}
+function fmtLeft(ms){const s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600),mi=Math.floor(s%3600/60),se=s%60;return (h?h+'h ':'')+mi+'m '+String(se).padStart(2,'0')+'s'}
+setInterval(()=>{
+  if(!S||gone)return;
+  const left=S.expires-now();
+  if(left<=0){showGone();return}
+  $('exp').textContent='Expires in '+fmtLeft(left)+' · '+new Date(S.expires).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+},1000);
+
+function renderList(){
+  const data=S.restaurants,mine=S.mine;
+  const max=Math.max(1,...data.map(r=>r.votes)),top=Math.max(...data.map(r=>r.votes),0);
+  const leaders=data.filter(r=>r.votes===top&&top>0);
+  $('lead').innerHTML=leaders.length?`<div class="lead">🏆 Leading: <b>${leaders.map(r=>esc(r.name)).join(', ')}</b> (${top} vote${top>1?'s':''})</div>`:'';
+  $('list').innerHTML=data.map(r=>`<div class="card"><div class="bar" style="width:${r.votes/max*100}%"></div><div class="row">
+  <div class="info"><div class="name">${esc(r.name)}</div><div class="note">${esc(r.note||'')}</div>
+  <div><button class="small" onclick="edit(${r.id})">Edit</button> <button class="small" onclick="del(${r.id})">Delete</button></div></div>
+  <div class="count">${r.votes}</div><button class="vote ${mine===r.id?'mine':''}" onclick="vote(${r.id})">${mine===r.id?'✓ Voted':'Vote'}</button></div></div>`).join('')||'<p class="sub">No restaurants yet — add one below.</p>';
+}
+const vote=id=>api('POST','/vote',{id});
+function edit(id){const r=S.restaurants.find(x=>x.id===id);if(!r)return;const n=prompt('Name',r.name);if(n===null)return;const d=prompt('Note',r.note||'');api('PUT','/restaurants/'+id,{name:n,note:d===null?r.note:d})}
+function del(id){if(confirm('Delete this restaurant?'))api('DELETE','/restaurants/'+id)}
+$('add').onsubmit=async e=>{e.preventDefault();const r=await api('POST','/restaurants',{name:$('n').value,note:$('d').value});if(r){$('n').value=$('d').value=''}};
+$('reset').onclick=()=>{if(confirm('Reset all votes for everyone in this room?'))api('POST','/reset')};
+
+// ----- wheel -----
+const COLORS=['#ff6b6b','#ffa94d','#ffd43b','#69db7c','#4dabf7','#9775fa','#f783ac','#38d9a9'];
+const cv=$('c'),ctx=cv.getContext('2d');
+function draw(angle){
+  const items=S?S.wheel.items.map(i=>i.name):[],n=items.length,R=420;ctx.clearRect(0,0,840,840);
+  if(!n){ctx.fillStyle='#ddd';ctx.beginPath();ctx.arc(R,R,R-6,0,7);ctx.fill();ctx.fillStyle='#666';ctx.font='36px sans-serif';ctx.textAlign='center';ctx.fillText('Add some choices!',R,R);return}
+  const a=2*Math.PI/n;
+  items.forEach((it,i)=>{
+    const s=angle+i*a-Math.PI/2;
+    ctx.beginPath();ctx.moveTo(R,R);ctx.arc(R,R,R-6,s,s+a);ctx.closePath();
+    ctx.fillStyle=COLORS[i%COLORS.length];ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=4;ctx.stroke();
+    ctx.save();ctx.translate(R,R);ctx.rotate(s+a/2);ctx.textAlign='right';ctx.fillStyle='#222';
+    ctx.font='bold '+(n>10?26:34)+'px sans-serif';ctx.fillText(it.length>16?it.slice(0,15)+'…':it,R-30,10);ctx.restore();
+  });
+}
+function renderChips(){
+  $('chips').innerHTML=S.wheel.items.map(x=>`<span class="chip">${esc(x.name)}<b onclick="rmItem(${x.id})" title="Remove">×</b></span>`).join('');
+}
+const rmItem=id=>api('DELETE','/wheel/items/'+id);
+$('wf').onsubmit=async e=>{e.preventDefault();const v=$('t').value.trim();if(!v)return;const r=await api('POST','/wheel/items',{name:v});if(r)$('t').value=''};
+$('clr').onclick=()=>api('POST','/wheel/clear');
+$('imp').onclick=()=>api('POST','/wheel/load');
+$('spin').onclick=async()=>{
+  if(!S)return;
+  if(S.wheel.items.length<2){$('result').textContent='Add at least 2 choices';return}
+  await api('POST','/wheel/spin');
+};
+let looping=false;const seenActive=new Set(),toasted=new Set();
+function wheelFrame(){
+  if(!S)return{active:false};
+  const w=S.wheel,sp=w.spin;let angle=w.angle,active=false,done=false;
+  if(sp){
+    const t=now();
+    if(t<sp.start){angle=sp.from;active=true}
+    else if(t>=sp.start+sp.duration){angle=sp.to;done=true}
+    else{const p=(t-sp.start)/sp.duration,e=1-Math.pow(1-p,3);angle=sp.from+(sp.to-sp.from)*e;active=true}
+  }
+  draw(angle);
+  const n=w.items.length;
+  $('spin').disabled=active||gone;
+  $('result').textContent=done?'🎉 '+sp.winner+'!':active?'':(n<2?'Add at least 2 choices':'');
+  if(active&&sp)seenActive.add(sp.id);
+  if(done&&seenActive.has(sp.id)&&!toasted.has(sp.id)){toasted.add(sp.id);if(view!=='wheel')toast('🎡 The wheel picked: '+sp.winner+'!',6000)}
+  return{active};
+}
+function startLoop(){
+  if(looping||!S)return;looping=true;
+  (function step(){const r=wheelFrame();if(r.active&&!gone)requestAnimationFrame(step);else looping=false})();
+}
+
+// ----- live updates -----
+let es=null;
+function connect(){
+  es=new EventSource(base+'/events?voter='+encodeURIComponent(voter));
+  es.onmessage=e=>{try{apply(JSON.parse(e.data))}catch{}};
+  es.addEventListener('expired',()=>showGone());
+  es.onerror=async()=>{
+    $('dot').className='dot';$('viewers').textContent='reconnecting…';
+    try{const r=await fetch(base);if(r.status===404)showGone()}catch{}
+  };
+}
+(async()=>{
+  setView(view,false);
+  const r=await fetch(base+'?voter='+encodeURIComponent(voter)).catch(()=>null);
+  if(r&&r.status===404){showGone();return}
+  if(r&&r.ok)apply(await r.json());
+  syncTime();connect();
+})();
+</script></body></html>
