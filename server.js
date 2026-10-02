@@ -256,8 +256,8 @@ http.createServer(async (req, res) => {
   const qs = new URL(req.url, 'http://x').searchParams;
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim();
 
-  // pages
-  if (req.method === 'GET') {
+  // pages (HEAD is answered like GET; Node drops the body)
+  if (req.method === 'GET' || req.method === 'HEAD') {
     if (url === '/' || url === '/index.html') return sendLanding(req, res);
     if (/^\/r\/\d{4}(\/wheel)?\/?$/.test(url)) return sendRoomPage(req, res, url);
     if (url === '/og-default.png') { try { return sendPng(res, defaultImage(), 86400); } catch (e) { res.writeHead(404); return res.end('Not found'); } }
